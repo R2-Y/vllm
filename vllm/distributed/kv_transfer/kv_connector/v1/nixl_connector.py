@@ -24,8 +24,8 @@ from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     CopyBlocksOp, KVConnectorBase_V1, KVConnectorMetadata, KVConnectorRole)
 from vllm.distributed.parallel_state import (
-    get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size,
-    get_tp_group)
+    get_pipeline_model_parallel_rank, get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size, get_tp_group)
 from vllm.distributed.utils import divide
 from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
@@ -240,7 +240,8 @@ class NixlConnectorScheduler:
         self.side_channel_port = (
             envs.VLLM_NIXL_SIDE_CHANNEL_PORT +
             vllm_config.parallel_config.data_parallel_rank *
-            vllm_config.parallel_config.tensor_parallel_size)
+            vllm_config.parallel_config.tensor_parallel_size *
+            vllm_config.parallel_config.pipeline_parallel_size)
         self.use_host_buffer = \
             vllm_config.kv_transfer_config.kv_buffer_device == "cpu"
         logger.info("Initializing NIXL Scheduler %s", engine_id)
@@ -441,7 +442,9 @@ class NixlConnectorWorker:
         # NIXL handshake port.
         # NOTE(rob): Within a DP group, each DP rank gets its own
         # base port (which is sent in the KVTransferParams).
-        # Each TP rank listens/queries on the base_port + tp_rank.
+        # Each TP rank listens/queries on the base_port +
+        # pp_rank * tp_size + tp_rank.
+        self.pp_rank = get_pipeline_model_parallel_rank()
         self.side_channel_port: int = (
             envs.VLLM_NIXL_SIDE_CHANNEL_PORT +
             vllm_config.parallel_config.data_parallel_rank *
@@ -742,7 +745,7 @@ class NixlConnectorWorker:
                 assert tensor_size_bytes == curr_tensor_size_bytes, \
                     "All kv cache tensors must have the same size"
                 caches_data.append(
-                    (base_addr, tensor_size_bytes, self.tp_rank, ""))
+                    (base_addr, tensor_size_bytes, self.device_id, ""))
 
         self.kv_caches_base_addr[self.engine_id] = seen_base_addresses
         self.num_regions = len(caches_data)
@@ -787,7 +790,7 @@ class NixlConnectorWorker:
                 block_offset = block_id * self.block_len
                 addr = base_addr + block_offset
                 # (addr, len, device id)
-                blocks_data.append((addr, kv_block_len, self.tp_rank))
+                blocks_data.append((addr, kv_block_len, self.device_id))
 
             if self._use_flashinfer:
                 # Separate and interleave K/V regions to maintain the same
@@ -799,8 +802,8 @@ class NixlConnectorWorker:
                     # Register addresses for V cache (K registered first).
                     v_addr = addr + kv_block_len
                     blocks_data.append((v_addr, kv_block_len, self.tp_rank))
-        logger.debug("Created %s blocks for src engine %s and rank %s",
-                     len(blocks_data), self.engine_id, self.tp_rank)
+        logger.debug("Created %s blocks for src engine %s, rank %s and device id %s",
+                     len(blocks_data), self.engine_id, self.tp_rank, self.device_id)
 
         descs = self.nixl_wrapper.get_xfer_descs(blocks_data,
                                                  self.nixl_memory_type)
@@ -1287,7 +1290,7 @@ class NixlConnectorWorker:
         """
         Get the block length for one K/V element (K and V have the same size).
 
-        For FA and other backends, this is equal to the length of the whole 
+        For FA and other backends, this is equal to the length of the whole
         block, as K and V are in separate regions.
         For FlashInfer, this is half the length of the whole block, as K and V
         share the same region.
