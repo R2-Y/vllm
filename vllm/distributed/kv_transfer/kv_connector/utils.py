@@ -130,11 +130,12 @@ class KVOutputAggregator:
                   outputs: list[ModelRunnerOutput],
                   output_rank: int = 0) -> ModelRunnerOutput:
         # aggregate kv_connector_output from all workers
-
+        logger.info(f"==============aggregate kv connector, output_rank {output_rank} ")
         def update_finished_set(req_ids: Optional[set[str]],
                                 remaining_count_dict: dict[str, int],
                                 finished_set: set[str]) -> None:
             for req_id in req_ids or ():
+                logger.info(f"=================remaining_count_dict [{req_id}] {remaining_count_dict[req_id]}")
                 remaining_count_dict[req_id] -= 1
                 if remaining_count_dict[req_id] == 0:
                     finished_set.add(req_id)
@@ -142,10 +143,16 @@ class KVOutputAggregator:
 
         finished_sending = set[str]()
         finished_recving = set[str]()
+        logger.info(f"==============aggregate kv connector outputs len {len(outputs)}, "
+                    f"self._send_remaining_count {self._send_remaining_count}, "
+                    f"self._recv_remaining_count {self._recv_remaining_count}, \n")
         for output in outputs:
             output = output.kv_connector_output
             if not output:
                 continue
+            logger.info(f"===============output.finished_sending {list(output.finished_sending)}, \n"
+                        f"output.finished_recving {list(output.finished_recving)}, \n"
+                        f"self._send_remaining_count {self._send_remaining_count}")
             update_finished_set(output.finished_sending,
                                 self._send_remaining_count, finished_sending)
             update_finished_set(output.finished_recving,
@@ -192,6 +199,7 @@ class KVOutputAggregator:
 
             return callback
 
+        logger.info(f"async_aggregate get futures")
         for i, output_future in enumerate(output_futures):
             output_future.add_done_callback(make_callback(i))
 

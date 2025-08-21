@@ -52,6 +52,7 @@ class RayDistributedExecutor(RayDistributedExecutorV0, Executor):
         self.has_connector = self.vllm_config.kv_transfer_config is not None
         self.kv_output_aggregator = KVOutputAggregator(
             self.parallel_config.world_size)
+        logger.info(f"=============_init_executor world_size {self.parallel_config.world_size}")
 
     @property
     def max_concurrent_batches(self) -> int:
@@ -74,6 +75,7 @@ class RayDistributedExecutor(RayDistributedExecutorV0, Executor):
         Returns:
             The model runner output.
         """
+        logger.info(f"=========Execute the model on the Ray workers")
         # Build the compiled DAG for the first time.
         if self.forward_dag is None:  # type: ignore
             self.forward_dag = self._compiled_ray_dag(enable_asyncio=False)
@@ -94,8 +96,10 @@ class RayDistributedExecutor(RayDistributedExecutorV0, Executor):
         if self.max_concurrent_batches == 1:
             # Block and get results from all workers
             outputs = [ref.get() for ref in refs]
+            logger.info(f"=========execute_model outputs {outputs}")
             return self.kv_output_aggregator.aggregate(outputs)
 
+        logger.info(f"=========execute_model return futurer")
         # Return a future that will aggregate outputs from all workers
         return FutureWrapper(refs, self.kv_output_aggregator)
 

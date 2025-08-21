@@ -132,6 +132,8 @@ try:
                 scheduler_output, intermediate_tensors = scheduler_output
             else:
                 scheduler_output, intermediate_tensors = scheduler_output, None
+            logger.info(f"=============execute_model_ray execute_model, scheduler_output {scheduler_output}"
+                        f", \n intermediate_tensors {intermediate_tensors}")
             output = self.worker.model_runner.execute_model(
                 scheduler_output, intermediate_tensors)
             if isinstance(output, IntermediateTensors):

@@ -263,6 +263,7 @@ class EngineCore:
     ) -> ModelRunnerOutput:
         """Execute the model and log detailed info on failure."""
         try:
+            logger.info(f"===========execute_model_with_error_logging")
             return model_fn(scheduler_output)
         except Exception as err:
             # We do not want to catch BaseException here since we're only
@@ -285,12 +286,14 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        logger.info(f"==============engine_core start step")
         scheduler_output = self.scheduler.schedule()
         model_output = self.execute_model_with_error_logging(
             self.model_executor.execute_model,  # type: ignore
             scheduler_output)
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output)  # type: ignore
+        logger.info(f"==============engine_core_outputs {engine_core_outputs}")
 
         return (engine_core_outputs,
                 scheduler_output.total_num_scheduled_tokens > 0)
@@ -318,7 +321,7 @@ class EngineCore:
         3. Update the scheduler from the output.
         """
         assert self.batch_queue is not None
-
+        logger.info(f"==============step_with_batch_queue")
         engine_core_outputs = None
         scheduler_output = None
         # Try to schedule a new batch if the batch queue is not full, but
@@ -326,14 +329,17 @@ class EngineCore:
         # Note that this is not blocking.
         if not self.batch_queue.full():
             scheduler_output = self.scheduler.schedule()
-            if scheduler_output.total_num_scheduled_tokens > 0:
-                future = self.model_executor.execute_model(scheduler_output)
-                self.batch_queue.put_nowait(
-                    (future, scheduler_output))  # type: ignore
+            # if scheduler_output.total_num_scheduled_tokens > 0:
+            future = self.model_executor.execute_model(scheduler_output)
+            self.batch_queue.put_nowait(
+                (future, scheduler_output))  # type: ignore
+            logger.info(f"==============step_with_batch_queue future {future}, "
+                        f"scheduler_output kv_connector_metadata{scheduler_output.kv_connector_metadata}")
 
         scheduled_batch = (scheduler_output is not None
                            and scheduler_output.total_num_scheduled_tokens > 0)
 
+        logger.info(f"==============scheduled_batch {scheduled_batch}, self.batch_queue {self.batch_queue}")
         # If no more requests can be scheduled and the job queue is not empty,
         # block until the first batch in the job queue is finished.
         # TODO(comaniac): Ideally we should peek the first batch in the
@@ -342,15 +348,15 @@ class EngineCore:
         # so we need more work.
         if not scheduled_batch and not self.batch_queue.empty():
             future, scheduler_output = self.batch_queue.get_nowait()
-
+            logger.info(f"=============scheduler_output {scheduled_batch}")
             # Blocking until the first result is available.
             model_output = self.execute_model_with_error_logging(
                 lambda _: future.result(), scheduler_output)
-
+            logger.info(f"========model_output {model_output}")
             self.batch_queue.task_done()
             engine_core_outputs = (self.scheduler.update_from_output(
                 scheduler_output, model_output))
-
+            logger.info(f"==============step_with_batch_queue engine_core_outputs {engine_core_outputs}")
         return engine_core_outputs, scheduled_batch
 
     def shutdown(self):

@@ -1508,16 +1508,19 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
-    ) -> Union[ModelRunnerOutput, IntermediateTensors]:
+    ) -> Union[ModelRunnerOutput, IntermediateTensors, bool]:
         self._update_states(scheduler_output)
+        logger.info(f"==========start execute_model,"
+                    f" total_num_scheduled_tokens {scheduler_output.total_num_scheduled_tokens}")
         if not scheduler_output.total_num_scheduled_tokens:
             if not has_kv_transfer_group():
                 # Return empty ModelRunnerOutput if there's no work to do.
                 return EMPTY_MODEL_RUNNER_OUTPUT
-
+            logger.info(f"==================start kv_connector_no_forward")
             return self.kv_connector_no_forward(scheduler_output,
                                                 self.vllm_config)
 
+        logger.info(f"========execute_model _prepare_inputs using scheduler_output {scheduler_output}")
         # Prepare the decoder inputs.
         (attn_metadata, logits_indices, spec_decode_metadata,
          num_scheduled_tokens_np, spec_decode_common_attn_metadata,
@@ -1601,6 +1604,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
+        logger.info(f"============start set_forward_context pp rank {get_pp_group().local_rank}")
         with set_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -1766,7 +1770,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             req_id = self.input_batch.req_ids[req_idx]
             req_state = self.requests[req_id]
             req_state.output_token_ids.extend(sampled_ids)
-
+        logger.info(f"======step valid_sampled_token_ids {valid_sampled_token_ids}")
         if self.speculative_config:
             assert spec_decode_common_attn_metadata is not None
             self._draft_token_ids = self.propose_draft_token_ids(

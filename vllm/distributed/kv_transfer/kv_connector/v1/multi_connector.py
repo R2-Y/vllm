@@ -91,6 +91,7 @@ class MultiConnector(KVConnectorBase_V1):
     def start_load_kv(self, forward_context: "ForwardContext",
                       **kwargs) -> None:
         for c in self._connectors:
+            logger.info(f"=================== start_load_kv, forward_context {forward_context}")
             c.start_load_kv(forward_context, **kwargs)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -112,7 +113,10 @@ class MultiConnector(KVConnectorBase_V1):
         finished_sending: set[str] = set()
         finished_recving: set[str] = set()
         for c in self._connectors:
+            logger.info(f"================get_finished finished_req_ids {finished_req_ids}")
             sending, recving = c.get_finished(finished_req_ids)
+            logger.info(f"================get_finished sending {list(sending)}, "
+                        f"recving {list(recving)}")
             if not recving and not sending:
                 continue
             # Aggregate finished recving request ids.
@@ -124,6 +128,7 @@ class MultiConnector(KVConnectorBase_V1):
                 extra_pending = self._extra_async_saves.get(req_id)
                 if extra_pending is None:
                     finished_sending.add(req_id)
+                    logger.info(f"==============add req_id {req_id} to finished_sending")
                     continue
                 assert extra_pending > 0
                 if extra_pending == 1:

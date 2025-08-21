@@ -59,6 +59,7 @@ class KVConnectorModelRunnerMixin:
     @staticmethod
     def kv_connector_no_forward(scheduler_output: "SchedulerOutput",
                                 vllm_config: VllmConfig) -> ModelRunnerOutput:
+        logger.info(f"======kv_connector_no_forward scheduler_output {scheduler_output}")
         # KV send/recv even if no work to do.
         with set_forward_context(
                 None, vllm_config
@@ -66,10 +67,13 @@ class KVConnectorModelRunnerMixin:
                 scheduler_output, wait_for_save=False) as kv_connector_output:
             pass
 
+        logger.info(f"kv_connector_output {kv_connector_output}")
         if (not kv_connector_output.finished_sending
                 and not kv_connector_output.finished_recving):
+            logger.info(f"============kv_connector_no_forward ")
             return EMPTY_MODEL_RUNNER_OUTPUT
 
+        logger.info(f"kv_connector_output {kv_connector_output}")
         output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
         output.kv_connector_output = kv_connector_output
         return output
@@ -78,6 +82,7 @@ class KVConnectorModelRunnerMixin:
     def maybe_get_kv_connector_output(
         scheduler_output: "SchedulerOutput"
     ) -> AbstractContextManager[Optional[KVConnectorOutput]]:
+        # logger.info(f"==============maybe_get_kv_connector_output _get_kv_connector_output")
         return KVConnectorModelRunnerMixin._get_kv_connector_output(
             scheduler_output) if has_kv_transfer_group() else nullcontext()
 
@@ -95,6 +100,8 @@ class KVConnectorModelRunnerMixin:
         kv_connector = get_kv_transfer_group()
         assert isinstance(kv_connector, KVConnectorBase)
         assert scheduler_output.kv_connector_metadata is not None
+        logger.info(f"=================scheduler_output.kv_connector_metadata "
+                    f"{scheduler_output.kv_connector_metadata}")
         kv_connector.bind_connector_metadata(
             scheduler_output.kv_connector_metadata)
 
@@ -102,6 +109,8 @@ class KVConnectorModelRunnerMixin:
         # These transfers are designed to be async and the requests
         # involved may be disjoint from the running requests.
         # Do this here to save a collective_rpc.
+        logger.info(f"==============_get_kv_connector_output start_load_kv, "
+                    f"scheduler_output.finished_req_ids {list(scheduler_output.finished_req_ids)}")
         kv_connector.start_load_kv(get_forward_context())
         try:
             yield output
@@ -111,5 +120,7 @@ class KVConnectorModelRunnerMixin:
 
             output.finished_sending, output.finished_recving = (
                 kv_connector.get_finished(scheduler_output.finished_req_ids))
+            logger.info(f"====================_get_kv_connector_output finished_sending {list(output.finished_sending)}, "
+                        f"finished_recving {list(output.finished_recving)}")
 
             kv_connector.clear_connector_metadata()

@@ -184,7 +184,7 @@ class MultiprocExecutor(Executor):
             args=(scheduler_output, ),
             non_block=non_block,
             timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS)
-
+        logger.info(f"===========execute_model outputs {outputs} ")
         # aggregate all workers output to a single output
         if non_block:
             return self.kv_output_aggregator.async_aggregate(

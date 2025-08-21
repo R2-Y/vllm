@@ -428,7 +428,7 @@ class RayDistributedExecutor(DistributedExecutorBase):
             execute_model_req: ExecuteModelRequest) -> List[SamplerOutput]:
         if not self.use_ray_spmd_worker:
             return super().execute_model(execute_model_req)
-
+        logger.info(f"=========Execute the model on the Ray workers")
         if self.forward_dag is None:
             self.forward_dag = self._compiled_ray_dag(enable_asyncio=False)
 
@@ -578,6 +578,8 @@ class RayDistributedExecutor(DistributedExecutorBase):
             # All workers in the first TP group will take in the
             # ExecuteModelRequest as input.
             outputs = [input_data for _ in self.pp_tp_workers[0]]
+            logger.info(f"self.pp_tp_workers len {len(self.pp_tp_workers)}, "
+                        f"self.pp_tp_workers {self.pp_tp_workers}")
             for pp_rank, tp_group in enumerate(self.pp_tp_workers):
                 # Each PP worker takes in the output of the previous PP worker,
                 # and the TP group executes in SPMD fashion.
@@ -636,7 +638,7 @@ class RayDistributedExecutor(DistributedExecutorBase):
             execute_model_req: ExecuteModelRequest) -> List[SamplerOutput]:
         if not self.use_ray_spmd_worker:
             return await super().execute_model_async(execute_model_req)
-
+        logger.info(f"=========Execute the model on the Ray workers")
         if self.forward_dag is None:
             self.forward_dag = self._compiled_ray_dag(enable_asyncio=True)
 
