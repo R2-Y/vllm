@@ -355,7 +355,7 @@ class Worker(WorkerBase):
         scheduler_output: "SchedulerOutput",
     ) -> Optional[ModelRunnerOutput]:
         intermediate_tensors = None
-        if not get_pp_group().is_first_rank:
+        if not get_pp_group().is_first_rank and scheduler_output.total_num_scheduled_tokens:
             intermediate_tensors = IntermediateTensors(
                 get_pp_group().recv_tensor_dict(
                     all_gather_group=get_tp_group()))
@@ -365,7 +365,7 @@ class Worker(WorkerBase):
 
         parallel_config = self.vllm_config.parallel_config
         if parallel_config.distributed_executor_backend != "external_launcher" \
-            and not get_pp_group().is_last_rank:
+            and not get_pp_group().is_last_rank and scheduler_output.total_num_scheduled_tokens:
             assert isinstance(output, IntermediateTensors)
             get_pp_group().send_tensor_dict(output.tensors,
                                             all_gather_group=get_tp_group())
