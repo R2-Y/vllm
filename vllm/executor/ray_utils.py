@@ -18,6 +18,8 @@ from vllm.utils import get_ip
 from vllm.worker.worker_base import WorkerWrapperBase
 
 if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+        KVConnectorMetadata)
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.outputs import ModelRunnerOutput
 
@@ -128,14 +130,27 @@ try:
             # and it needs a special logic of self.setup_device_if_necessary()
             self.setup_device_if_necessary()
             assert self.worker is not None, "Worker is not initialized"
+
+            logger.info(f"================ 2.1 scheduler_output {scheduler_output} ")
             if isinstance(scheduler_output, tuple):
                 scheduler_output, intermediate_tensors = scheduler_output
             else:
                 scheduler_output, intermediate_tensors = scheduler_output, None
+
             output = self.worker.model_runner.execute_model(
                 scheduler_output, intermediate_tensors)
             if isinstance(output, IntermediateTensors):
                 output = scheduler_output, output
+            return output
+        
+        def nixl_pull_kvcache_ray(
+            self,
+            scheduler_output: "SchedulerOutput"
+        ) -> "ModelRunnerOutput":
+            assert self.worker is not None, "Worker is not initialized"
+
+            output = self.worker.model_runner.nixl_pull_kvcache(
+                scheduler_output)
             return output
 
         def override_env_vars(self, vars: Dict[str, str]):

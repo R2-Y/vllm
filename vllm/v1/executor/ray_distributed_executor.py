@@ -40,6 +40,71 @@ class FutureWrapper(Future):
         return self.aggregator.aggregate(outputs, output_rank=0)
 
 
+class KVCacheFutureWrapper(Future):
+    """A wrapper around concurrent.futures.Future objects to handle KV cache operations.
+    
+    This class is used when pulling KV cache from workers, where the futures
+    are ThreadPoolExecutor futures that resolve Ray object references.
+    """
+
+    def __init__(self, futures, parallel_config, aggregator=None):
+        super().__init__()
+        self.futures = futures
+        self.parallel_config = parallel_config
+        self.aggregator = aggregator
+        self._result_cache = None
+        self._completed = False
+
+    def result(self, timeout=None):
+        if timeout is not None:
+            raise NotImplementedError("timeout is not supported")
+
+        if self._completed:
+            return self._result_cache
+
+        # Wait for all futures to complete and get their results
+        outputs = [future.result() for future in self.futures]
+
+        # Only returns ModelRunnerOutput from TP rank=0 and PP rank=-1
+        out_rank = self.parallel_config.world_size - self.parallel_config.tensor_parallel_size
+        logger.info(f"=========== outputs {outputs}, out_rank {out_rank}")
+        if self.aggregator is None:
+            # No aggregator means no connector, so return the first output
+            self._result_cache = outputs[out_rank]
+        else:
+            # Use aggregator to combine outputs from all workers
+            self._result_cache = self.aggregator.aggregate(outputs, output_rank=out_rank)
+        
+        self._completed = True
+        return self._result_cache
+
+    def get(self, timeout=None):
+        """Implement Ray object reference interface for compatibility.
+        
+        This is needed because the engine core sometimes expects .get() method
+        when dealing with Ray object references.
+        """
+        return self.result(timeout)
+
+    def done(self):
+        """Check if all underlying futures are completed."""
+        if self._completed:
+            return True
+        return all(future.done() for future in self.futures)
+
+    def cancel(self):
+        """Cancel all underlying futures."""
+        success = True
+        for future in self.futures:
+            if not future.cancel():
+                success = False
+        return success
+
+    def cancelled(self):
+        """Check if any underlying future is cancelled."""
+        return any(future.cancelled() for future in self.futures)
+
+
 class RayDistributedExecutor(RayDistributedExecutorV0, Executor):
     """Ray distributed executor using Ray Compiled Graphs."""
 
@@ -74,9 +139,13 @@ class RayDistributedExecutor(RayDistributedExecutorV0, Executor):
         Returns:
             The model runner output.
         """
+        if not scheduler_output.total_num_scheduled_tokens:
+            return self.nixl_pull_kvcache(scheduler_output)
+
         # Build the compiled DAG for the first time.
         if self.forward_dag is None:  # type: ignore
             self.forward_dag = self._compiled_ray_dag(enable_asyncio=False)
+        logger.info(f"================ 1 execute_model scheduler_output {scheduler_output}")
 
         refs = self.forward_dag.execute(scheduler_output)  # type: ignore
 
@@ -95,7 +164,6 @@ class RayDistributedExecutor(RayDistributedExecutorV0, Executor):
             # Block and get results from all workers
             outputs = [ref.get() for ref in refs]
             return self.kv_output_aggregator.aggregate(outputs)
-
         # Return a future that will aggregate outputs from all workers
         return FutureWrapper(refs, self.kv_output_aggregator)
 
@@ -106,3 +174,47 @@ class RayDistributedExecutor(RayDistributedExecutorV0, Executor):
         ReconfigureRankType.SHUTDOWN_CURRENT_RANK:
             self.shutdown()
         return
+
+    def nixl_pull_kvcache(
+        self,
+        scheduler_output,
+    ) :
+        """Pull KVCache on the Ray workers.
+
+        Args:
+            scheduler_output: The scheduler output to execute.
+
+        """
+        import ray
+        from concurrent.futures import ThreadPoolExecutor
+        # logger.info(f"===============nixlconnector_pull_kvcache, "
+        #             f"self.pp_tp_workers {self.pp_tp_workers}")
+        output_refs = [
+            (worker.nixl_pull_kvcache_ray.remote(scheduler_output)
+             for worker in workers)
+            for workers in self.pp_tp_workers
+        ]
+        all_object_refs = []
+        for generator in output_refs:
+            for obj_ref in generator:
+                all_object_refs.append(obj_ref)
+        # logger.info(f"==============output_refs {all_object_refs}")
+
+        # all_model_runner_outputs = [ray.get(obj_ref) for obj_ref in all_object_refs]
+        # logger.info(f"==============nixl_pull_kvcache  model_output {all_model_runner_outputs}")
+        # model_output =self.kv_output_aggregator.aggregate(all_model_runner_outputs, output_rank=0)
+        # # logger.info(f"==============nixl_pull_kvcache  model_output {model_output}")
+        #
+        # return model_output
+        
+        def create_future_for_ref(obj_ref):
+            return executor.submit(ray.get, obj_ref)
+
+        executor = ThreadPoolExecutor()  # Don't use 'with' when returning futures
+        futures = [create_future_for_ref(obj_ref) for obj_ref in all_object_refs]
+        # logger.info(f"==============futures {futures}")
+        
+        # Return a KVCacheFutureWrapper that can handle the concurrent.futures.Future objects
+        return KVCacheFutureWrapper(futures, self.parallel_config,
+                                    self.kv_output_aggregator if self.has_connector else None)
+

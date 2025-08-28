@@ -14,6 +14,7 @@ from logging import DEBUG
 from typing import Any, Callable, Optional, TypeVar, Union
 
 import msgspec
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector import NixlConnector
 import zmq
 
 from vllm.config import ParallelConfig, VllmConfig
@@ -326,9 +327,20 @@ class EngineCore:
         # Note that this is not blocking.
         if not self.batch_queue.full():
             scheduler_output = self.scheduler.schedule()
+            # if scheduler_output.total_num_scheduled_tokens > 0:
+            logger.info(f"=============step_with_batch_queue schedule {scheduler_output}")
             future = self.model_executor.execute_model(scheduler_output)
             self.batch_queue.put_nowait(
                 (future, scheduler_output))  # type: ignore
+            
+            # if self.vllm_config.kv_transfer_config is not None:
+            #     if self.vllm_config.kv_transfer_config.kv_connector == "NixlConnector" and \
+            #         not scheduler_output.total_num_scheduled_tokens:
+            #         model_runner_output = self.model_executor.nixl_pull_kvcache(scheduler_output)
+            #         logger.info(f"get model runner output {model_runner_output}")
+            #         if model_runner_output.kv_connector_output:
+            #             self.scheduler._update_from_kv_xfer_finished(
+            #                 model_runner_output.kv_connector_output)
 
         scheduled_batch = (scheduler_output is not None
                            and scheduler_output.total_num_scheduled_tokens > 0)
@@ -347,6 +359,7 @@ class EngineCore:
                 lambda _: future.result(), scheduler_output)
 
             self.batch_queue.task_done()
+            logger.info(f"model_output {model_output}, scheduler_output {scheduler_output}")
             engine_core_outputs = (self.scheduler.update_from_output(
                 scheduler_output, model_output))
 

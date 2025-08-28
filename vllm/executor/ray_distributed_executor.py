@@ -433,6 +433,7 @@ class RayDistributedExecutor(DistributedExecutorBase):
             self.forward_dag = self._compiled_ray_dag(enable_asyncio=False)
 
         if self.use_v1:
+            logger.info(f"================ execute_model {execute_model_req}")
             serialized_data = execute_model_req
         else:
             serialized_data = self.input_encoder.encode(execute_model_req)
@@ -582,6 +583,7 @@ class RayDistributedExecutor(DistributedExecutorBase):
                 # Each PP worker takes in the output of the previous PP worker,
                 # and the TP group executes in SPMD fashion.
                 if self.use_v1:
+                    logger.info(f"_compiled_ray_dag pp_rank {pp_rank}, outputs {outputs}")
                     outputs = [
                         worker.execute_model_ray.
                         bind(  # type: ignore[attr-defined]

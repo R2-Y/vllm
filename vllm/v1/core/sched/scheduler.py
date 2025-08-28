@@ -329,6 +329,7 @@ class Scheduler(SchedulerInterface):
         # Next, schedule the WAITING requests.
         if not preempted_reqs:
             while self.waiting and token_budget > 0:
+                logger.info(f"self.waiting {self.waiting}")
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
@@ -340,7 +341,7 @@ class Scheduler(SchedulerInterface):
                     if is_ready:
                         request.status = RequestStatus.WAITING
                     else:
-                        logger.debug(
+                        logger.info(
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request.request_id)
                         self.waiting.pop_request()
@@ -981,6 +982,7 @@ class Scheduler(SchedulerInterface):
     def add_request(self, request: Request) -> None:
         self.waiting.add_request(request)
         self.requests[request.request_id] = request
+        logger.info(f"add request {request.request_id}")
         if self.log_stats:
             request.record_event(EngineCoreEventType.QUEUED)
 

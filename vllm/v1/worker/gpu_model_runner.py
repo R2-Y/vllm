@@ -704,6 +704,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         """
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         assert total_num_scheduled_tokens > 0
+        logger.info(f"==========self.input_batch {self.input_batch}")
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
 
@@ -1502,6 +1503,18 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             pooler_output=pooler_output,
             kv_connector_output=kv_connector_output,
         )
+    
+    def nixl_pull_kvcache(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> "ModelRunnerOutput":
+        # self._update_states(scheduler_output)
+        if not has_kv_transfer_group():
+            # Return empty ModelRunnerOutput if there's no work to do.
+            return EMPTY_MODEL_RUNNER_OUTPUT
+
+        return self.kv_connector_no_forward(scheduler_output,
+                                            self.vllm_config)
 
     @torch.inference_mode()
     def execute_model(
@@ -1509,6 +1522,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors]:
+        logger.info(f"================3 scheduler_output {scheduler_output}")
         self._update_states(scheduler_output)
         if not scheduler_output.total_num_scheduled_tokens:
             if not has_kv_transfer_group():
@@ -1601,6 +1615,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
+        logger.info(f"===========model runner scheduler_output {scheduler_output} "
+                    f"for PP {get_pp_group().rank_in_group}")
         with set_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -1766,7 +1782,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             req_id = self.input_batch.req_ids[req_idx]
             req_state = self.requests[req_id]
             req_state.output_token_ids.extend(sampled_ids)
-        logger.info(f"======step valid_sampled_token_ids {valid_sampled_token_ids}")
+        logger.info(f"======step valid_sampled_token_ids {valid_sampled_token_ids} ,\n"
+                    f"kv_connector_output {kv_connector_output}"
+                    f"for PP {get_pp_group().rank_in_group}")
         if self.speculative_config:
             assert spec_decode_common_attn_metadata is not None
             self._draft_token_ids = self.propose_draft_token_ids(
