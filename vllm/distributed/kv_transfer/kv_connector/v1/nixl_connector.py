@@ -936,9 +936,12 @@ class NixlConnectorWorker:
         so that the whole cache is shared by "tp_ratio" D TP workers.
         """ # noqa: E501
         engine_id = nixl_agent_meta.engine_id
+        # remote_pp_rank = self.pp_rank # don't support heterogeneous PP
         # TODO re-evaluate refreshing for scaling/recovery
+        logger.info(f"========== remote pp rank {remote_pp_rank}, engine id {engine_id}")
         if remote_tp_rank in self._remote_agents.get(engine_id, {}).get(
                 remote_pp_rank, {}):
+            logger.info(f"remote_tp_rank {remote_tp_rank}")
             return self._remote_agents[engine_id][remote_pp_rank][
                 remote_tp_rank]
 
@@ -951,11 +954,12 @@ class NixlConnectorWorker:
 
         remote_agent_name = self.nixl_wrapper.add_remote_agent(
             nixl_agent_meta.agent_metadata)
-
+        logger.info(f"========== remote_agent_name {remote_agent_name}")
         # Number of D TP workers reading from a single P TP worker. This is
         # 1 when P and D `--tensor-parallel-size` match.
         tp_ratio = divide(self._tp_size[self.engine_id],
                           self._tp_size[engine_id])
+        logger.info(f"========== x")
         assert tp_ratio > 0, "Decode TP cannot be smaller than prefill TP"
         assert not self._use_pallas_v1 or tp_ratio == 1, \
                "TPU (pallas_v1) DOES NOT support heterogeneous TP yet."
@@ -963,6 +967,7 @@ class NixlConnectorWorker:
         # Handle tp_size>num_kv_heads: replicate KV cache.
         total_num_kv_heads = self.model_config.get_total_num_kv_heads()
         is_kv_replicated = self._tp_size[engine_id] // total_num_kv_heads >= 1
+        logger.info(f"========== 1")
 
         if self.use_mla or is_kv_replicated:
             # With MLA the only difference is in the number of blocks.
@@ -983,7 +988,7 @@ class NixlConnectorWorker:
                 "Remote P worker KV layer cache must be of shape [2, N, "
                 "local_kv_heads*tp_ratio, block_size, head_dim] and same dtype."
             )
-
+        logger.info(f"========== 2")
         assert self.block_size == remote_block_size, (
             "Remote P worker with different block size is not supported "
             f"{self.block_size=} {remote_block_size=}")
@@ -993,7 +998,7 @@ class NixlConnectorWorker:
             assert self.dst_num_blocks[engine_id] == nixl_agent_meta.num_blocks
         else:
             self.dst_num_blocks[engine_id] = nixl_agent_meta.num_blocks
-
+        logger.info(f"========== 3")
         blocks_data = []
         # With homogeneous TP, D pulls the whole kv cache from corresponding
         # rank. With heterogeneous TP, prepare the descriptors by splitting the
@@ -1004,6 +1009,7 @@ class NixlConnectorWorker:
         kv_block_len = self.get_backend_aware_kv_block_len()
         rank_offset = self.tp_rank % tp_ratio * kv_block_len \
             if not (self.use_mla or is_kv_replicated) else 0
+        logger.info(f"========== 4")
         # Register all remote blocks, but only the corresponding kv heads.
         for base_addr in nixl_agent_meta.kv_caches_base_addr:
             for block_id in range(nixl_agent_meta.num_blocks):
@@ -1024,7 +1030,7 @@ class NixlConnectorWorker:
                     blocks_data.append((v_addr, kv_block_len,
                                         remote_tp_rank + remote_pp_rank * remote_tp_size))
 
-        logger.debug(
+        logger.info(
             "Created %s blocks for dst engine %s with remote rank %s and "
             "tp local rank %s, device id %s", len(blocks_data), engine_id,
             remote_tp_rank, self.tp_rank,
@@ -1033,9 +1039,11 @@ class NixlConnectorWorker:
         # Register with NIXL.
         descs = self.nixl_wrapper.get_xfer_descs(blocks_data,
                                                  self.nixl_memory_type)
+        logger.info(f"descs {descs}")
         self.dst_xfer_side_handles[
             engine_id] = self.nixl_wrapper.prep_xfer_dlist(
                 remote_agent_name, descs)
+        logger.info(f"dst_xfer_side_handles {self.dst_xfer_side_handles}")
 
         return remote_agent_name
 
@@ -1165,7 +1173,7 @@ class NixlConnectorWorker:
         """
         for req_id, meta in metadata.reqs_to_recv.items():
             remote_engine_id = meta.remote_engine_id
-            logger.debug(
+            logger.info(
                 "start_load_kv for request %s from remote engine %s. "
                 "Num local_block_ids: %s. Num remote_block_ids: %s. ", req_id,
                 remote_engine_id, len(meta.local_block_ids),
@@ -1191,7 +1199,7 @@ class NixlConnectorWorker:
         self._reqs_to_send.update(metadata.reqs_to_send)
 
     def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):
-        logger.debug(
+        logger.info(
             "Remote agent %s available, calling _read_blocks for req %s",
             meta.remote_engine_id, req_id)
         self._read_blocks(
@@ -1219,7 +1227,9 @@ class NixlConnectorWorker:
         tp_ratio = self._tp_size[
             self.engine_id] // self._tp_size[dst_engine_id]
         notif_id = f"{request_id}:{tp_ratio}".encode()
-
+        logger.info(f"_read_blocks tp_ratio {tp_ratio}, notif_id {notif_id}, dst_engine_id {dst_engine_id}, "
+                    f"self.engine_id {self.engine_id}, tp _size {self._tp_size[self.engine_id]}, "
+                    f"self._tp_size[dst_engine_id] {self._tp_size[dst_engine_id]}")
         # Full prefix cache hit: do not need to read remote blocks,
         # just notify P worker that we have the blocks we need.
         num_local_blocks = len(local_block_ids)

@@ -212,7 +212,7 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
         self._hand_shake_latency = hand_shake_latency
 
     def _nixl_handshake(self, host: str, port: int, remote_tp_size: int,
-                        expected_engine_id: str) -> dict[int, str]:
+                        remote_pp_size: int, expected_engine_id: str) -> dict[int, str]:
         # Mimic slow _nixl_handshake, as well as bypass zmq communication.
         time.sleep(self._hand_shake_latency)
         # These should've been done in register_kv_caches(), called by
@@ -223,6 +223,13 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
         self.dst_num_blocks[self.engine_id] = self.num_blocks
 
         assert expected_engine_id == self.REMOTE_ENGINE_ID
+
+        print(f">>>> into _nixl_handshake")
+        # # Compute the remote TP rank this local worker should contact
+        print(f"self._tp_size {self._tp_size}, engine_id:{self.engine_id}")
+        # tp_ratio = max(1, self._tp_size.get(self.engine_id, 1) // remote_tp_size)
+        # p_remote_tp_rank = self.tp_rank // tp_ratio
+        # p_remote_pp_rank = self.pp_rank
 
         remote_agent_name = self.add_remote_agent(
             NixlAgentMetadata(
@@ -236,7 +243,16 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
                 # is started. We mock HND here.
                 kv_cache_layout="HND",
             ),
-            remote_tp_size=remote_tp_size)
+            # remote_tp_rank=p_remote_tp_rank,
+            remote_tp_size=remote_tp_size,
+            # remote_pp_rank=p_remote_pp_rank,
+            remote_pp_size=remote_pp_size)
+
+        # print(f"===============remote_agent_name {remote_agent_name}, expected_engine_id {expected_engine_id}, "
+        #       f"pp rank {self.pp_rank}")
+        # Ensure mapping is immediately visible to the worker before queuing
+        # self._remote_agents[expected_engine_id][self.pp_rank] = {p_rSemote_tp_rank: remote_agent_name}
+        # return {p_remote_tp_rank: remote_agent_name}
         return {0: remote_agent_name}
 
 
@@ -424,6 +440,295 @@ class TestNixlHandshake:
                 if cnt_finished_reqs == total_reqs:
                     return
         raise TimeoutError("Took too long to complete async handshake.")
+
+    @patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector.NixlWrapper",
+        FakeNixlWrapper)
+    @pytest.mark.parametrize(
+        "decode_tp_size, prefill_tp_size, decode_pp_size, prefill_pp_size",
+        [
+            # (1, 1, 1, 1),
+            # (2, 1, 2, 2),
+            (4, 2, 2, 2),
+            # (4, 4, 2, 2),
+        ],
+    )
+    def test_async_load_kv_with_pp(
+            self,
+            dist_init,
+            decode_tp_size,
+            prefill_tp_size,
+            decode_pp_size,
+            prefill_pp_size):
+        """Verify async load_kv works when PP sizes are configured.
+
+        We set both TP and PP sizes for decode (consumer) and prefill (producer)
+        and ensure start_load_kv is non-blocking and finishes.
+        """
+
+        vllm_config = create_vllm_config()
+        vllm_config.parallel_config.tensor_parallel_size = decode_tp_size
+        vllm_config.parallel_config.pipeline_parallel_size = decode_pp_size
+        print(f"vllm_config.parallel_config.tensor_parallel_size {decode_tp_size}, "
+              f"vllm_config.parallel_config.pipeline_parallel_size {decode_pp_size}")
+        connector = NixlConnector(vllm_config, KVConnectorRole.WORKER)
+        connector.connector_worker = FakeNixlConnectorWorker(
+            vllm_config, connector.engine_id, hand_shake_latency=0)
+        connector.connector_worker._tp_size = {
+            connector.connector_worker.engine_id:
+                decode_tp_size}
+
+        metadata = NixlConnectorMetadata()
+        print(f"prefill_tp_size {prefill_tp_size}, "
+              f"prefill_pp_size {prefill_pp_size}")
+        metadata.add_new_req(request_id="id",
+                             local_block_ids=[1, 2, 3],
+                             kv_transfer_params={
+                                 "remote_block_ids": [4, 5, 6],
+                                 "remote_engine_id":
+                                 FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
+                                 "remote_host": "localhost",
+                                 "remote_port": 1234,
+                                 # Producer sizes (TP, PP)
+                                 "tp_size": prefill_tp_size,
+                                 "pp_size": prefill_pp_size,
+                             })
+        connector.bind_connector_metadata(metadata)
+
+        timeout = 6.0
+        start = time.perf_counter()
+        while time.perf_counter() - start < timeout:
+            dummy_ctx = ForwardContext(
+                no_compile_layers={},
+                attn_metadata={},
+                virtual_engine=0,
+            )
+            _before_load = time.perf_counter()
+            print(f">>>> before start load kv")
+            connector.start_load_kv(dummy_ctx)
+            print(f">>>> after load kv")
+            _after_load = time.perf_counter()
+            assert _after_load - _before_load < 0.1, "start_load_kv took " \
+                f"{_after_load - _before_load} seconds"
+            time.sleep(0.2)  # allow background handshake and transfer
+            connector.bind_connector_metadata(NixlConnectorMetadata())
+            _, done_recving = connector.get_finished(finished_req_ids=set())
+            if len(done_recving) > 0:
+                return
+        raise TimeoutError("Took too long to complete async handshake with PP.")
+
+    @patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector.NixlWrapper",
+        FakeNixlWrapper)
+    @pytest.mark.parametrize("pp_rank", [0, 1])
+    def test_full_hit_notif_routes_by_pp_rank(self, dist_init, pp_rank):
+        """On full prefix hit, notification should route via correct PP rank.
+
+        We force local_block_ids to be empty so _read_blocks sends a notif to
+        the remote agent indexed by [pp_rank][tp_rank]. We intercept send_notif
+        and assert the agent name matches the one registered under pp_rank.
+        """
+
+        vllm_config = create_vllm_config()
+        vllm_config.parallel_config.tensor_parallel_size = 1
+        vllm_config.parallel_config.pipeline_parallel_size = 2
+
+        connector = NixlConnector(vllm_config, KVConnectorRole.WORKER)
+        connector.connector_worker = FakeNixlConnectorWorker(
+            vllm_config, connector.engine_id, hand_shake_latency=0)
+
+        # Override pp_rank to simulate different pipeline ranks.
+        worker = connector.connector_worker
+        worker.pp_rank = pp_rank
+
+        # Capture send_notif calls with the agent used
+        sent = {}
+
+        def _capture_send_notif(agent_name: str, notif_msg: bytes) -> None:
+            sent['agent_name'] = agent_name
+            sent['notif_msg'] = notif_msg
+
+        worker.nixl_wrapper.send_notif = _capture_send_notif  # type: ignore[attr-defined]
+
+        # Bind metadata that causes a full prefix cache hit (no local blocks)
+        metadata = NixlConnectorMetadata()
+        metadata.add_new_req(request_id="rid",
+                             local_block_ids=[],
+                             kv_transfer_params={
+                                 "remote_block_ids": [10, 11, 12],
+                                 "remote_engine_id":
+                                 FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
+                                 "remote_host": "localhost",
+                                 "remote_port": 1234,
+                                 "tp_size": 1,
+                                 "pp_size": 2,
+                             })
+        connector.bind_connector_metadata(metadata)
+
+        # Trigger handshake and then the notification path
+        dummy_ctx = ForwardContext(
+            no_compile_layers={},
+            attn_metadata={},
+            virtual_engine=0,
+        )
+        connector.start_load_kv(dummy_ctx)
+
+        # Wait briefly for background handshake then process ready queue
+        time.sleep(0.1)
+        connector.bind_connector_metadata(NixlConnectorMetadata())
+        _ = connector.get_finished(finished_req_ids=set())
+
+        # Verify send_notif was called and routed via the pp_rank entry
+        assert 'agent_name' in sent, f"send_notif was not called"
+        # The agent should be the one stored under [pp_rank][0]
+        agent_name_expected = worker._remote_agents[
+            FakeNixlConnectorWorker.REMOTE_ENGINE_ID][pp_rank][0]
+        assert sent['agent_name'] == agent_name_expected
+
+    @patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector.NixlWrapper",
+        FakeNixlWrapper)
+    @pytest.mark.parametrize("pp_rank", [0, 1])
+    def test_handshake_zmq_port_offset_uses_pp_rank(self, dist_init, pp_rank):
+        """Ensure ZMQ path port = base + remote_tp_size*pp_rank + remote_tp_rank."""
+
+        import msgspec
+        from vllm.distributed.kv_transfer.kv_connector.v1 import nixl_connector as nc
+
+        vllm_config = create_vllm_config()
+
+        # Use the real worker to exercise _nixl_handshake path building.
+        connector = NixlConnector(vllm_config, KVConnectorRole.WORKER)
+        worker = NixlConnectorWorker(vllm_config, connector.engine_id)
+
+        # Minimal registration state
+        worker.slot_size_bytes = 4096
+        worker.block_len = worker.slot_size_bytes * worker.block_size
+        worker.num_blocks = 1
+        worker.dst_num_blocks[worker.engine_id] = worker.num_blocks
+
+        # Configure decode sizes and ranks
+        decode_tp_size = 4
+        remote_tp_size = 2
+        worker._tp_size[worker.engine_id] = decode_tp_size
+        worker.tp_rank = 1  # => p_remote_tp_rank = 1 // (4//2) = 0
+        worker.pp_rank = pp_rank
+
+        # Build encoded remote metadata
+        tp_ratio = decode_tp_size // remote_tp_size
+        meta = NixlAgentMetadata(
+            engine_id=FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
+            agent_metadata=FakeNixlWrapper.AGENT_METADATA,
+            kv_caches_base_addr=[0],
+            num_blocks=1,
+            block_len=worker.block_len * tp_ratio,
+            attn_backend_name=worker.backend_name,
+            kv_cache_layout=worker.kv_cache_layout,
+        )
+        encoded = msgspec.msgpack.Encoder().encode(meta)
+
+        # Capture the computed path and short-circuit ZMQ
+        captured = {}
+
+        def fake_make_zmq_path(scheme, host, port):
+            captured['host'] = host
+            captured['port'] = port
+            return f"{scheme}://{host}:{port}"
+
+        class _FakeSock:
+            def send(self, _):
+                pass
+
+            def recv(self):
+                return encoded
+
+        @contextlib.contextmanager
+        def fake_zmq_ctx(socket_type, addr):
+            yield _FakeSock()
+
+        # Patch helpers in module under test
+        orig_make = nc.make_zmq_path
+        orig_ctx = nc.zmq_ctx
+        try:
+            nc.make_zmq_path = fake_make_zmq_path  # type: ignore
+            nc.zmq_ctx = fake_zmq_ctx  # type: ignore
+
+            base_port = 5555
+            remote_pp_size = 2
+            _ = worker._nixl_handshake(
+                host="localhost",
+                port=base_port,
+                remote_tp_size=remote_tp_size,
+                remote_pp_size=remote_pp_size,
+                expected_engine_id=FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
+            )
+
+            expected_port = base_port + remote_tp_size * pp_rank + 0
+            assert captured['port'] == expected_port, \
+                f"expected port {expected_port}, got {captured['port']}"
+        finally:
+            nc.make_zmq_path = orig_make  # type: ignore
+            nc.zmq_ctx = orig_ctx  # type: ignore
+
+    @patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector.NixlWrapper",
+        FakeNixlWrapper)
+    def test_add_remote_agent_idempotent_per_pp_rank(self, dist_init):
+        """add_remote_agent should be idempotent for same (pp,tp) tuple."""
+
+        vllm_config = create_vllm_config()
+        connector = NixlConnector(vllm_config, KVConnectorRole.WORKER)
+        worker = NixlConnectorWorker(vllm_config, connector.engine_id)
+
+        # Minimal registration state
+        worker.slot_size_bytes = 4096
+        worker.block_len = worker.slot_size_bytes * worker.block_size
+        worker.num_blocks = 1
+        worker.dst_num_blocks[worker.engine_id] = worker.num_blocks
+
+        # Decode/producer sizes
+        decode_tp_size = 2
+        remote_tp_size = 1
+        worker._tp_size[worker.engine_id] = decode_tp_size
+        worker.tp_rank = 0
+        worker.pp_rank = 1
+
+        # Count calls into wrapper for descriptor registration
+        call_counts = {"get_xfer_descs": 0, "prep_xfer_dlist": 0}
+        orig_get_xfer_descs = worker.nixl_wrapper.get_xfer_descs
+        orig_prep = worker.nixl_wrapper.prep_xfer_dlist
+
+        def _count_get_xfer_descs(*args, **kwargs):
+            call_counts["get_xfer_descs"] += 1
+            return orig_get_xfer_descs(*args, **kwargs)
+
+        def _count_prep(*args, **kwargs):
+            call_counts["prep_xfer_dlist"] += 1
+            return orig_prep(*args, **kwargs)
+
+        worker.nixl_wrapper.get_xfer_descs = _count_get_xfer_descs  # type: ignore[attr-defined]
+        worker.nixl_wrapper.prep_xfer_dlist = _count_prep  # type: ignore[attr-defined]
+
+        meta = NixlAgentMetadata(
+            engine_id=FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
+            agent_metadata=FakeNixlWrapper.AGENT_METADATA,
+            kv_caches_base_addr=[0],
+            num_blocks=1,
+            block_len=worker.block_len,
+            attn_backend_name=worker.backend_name,
+            kv_cache_layout=worker.kv_cache_layout,
+        )
+
+        # First call should register descriptors
+        a1 = worker.add_remote_agent(
+            meta, remote_tp_rank=0, remote_tp_size=remote_tp_size, remote_pp_rank=1, remote_pp_size=2)
+        # Second call (same pp,tp) should be a no-op and return same agent
+        a2 = worker.add_remote_agent(
+            meta, remote_tp_rank=0, remote_tp_size=remote_tp_size, remote_pp_rank=1, remote_pp_size=2)
+
+        assert a1 == a2
+        assert call_counts["get_xfer_descs"] == 1
+        assert call_counts["prep_xfer_dlist"] == 1
 
     @patch(
         "vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector.NixlWrapper",
