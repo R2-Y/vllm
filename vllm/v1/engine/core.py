@@ -59,6 +59,8 @@ HANDSHAKE_TIMEOUT_MINS = 5
 _R = TypeVar('_R')  # Return type for collective_rpc
 
 
+from viztracer import VizTracer, get_tracer
+
 class EngineCore:
     """Inner loop of vLLM's Engine."""
 
@@ -158,6 +160,13 @@ class EngineCore:
 
             self.request_block_hasher = get_request_block_hasher(
                 block_size, caching_hash_fn)
+
+        self.tracer = VizTracer(
+                                include_files=["*vllm*"],
+                                # ignore_c_function=True,
+                                # ignore_frozen=True,
+                                verbose=1)
+        self.tracer.start()
 
     def _initialize_kv_caches(
             self, vllm_config: VllmConfig) -> tuple[int, int, KVCacheConfig]:
@@ -330,8 +339,10 @@ class EngineCore:
 
         model_executed = False
         if self.scheduler.has_requests():
-            scheduler_output = self.scheduler.schedule()
-            future = self.model_executor.execute_model(scheduler_output)
+            with self.tracer.log_event("scheduler_schedule"):
+                scheduler_output = self.scheduler.schedule()
+            with self.tracer.log_event("async_execute_model"):
+                future = self.model_executor.execute_model(scheduler_output)
             batch_queue.appendleft(
                 (future, scheduler_output))  # type: ignore[arg-type]
 
@@ -350,12 +361,16 @@ class EngineCore:
 
         # Block until the next result is available.
         future, scheduler_output = batch_queue.pop()
-        model_output = self.execute_model_with_error_logging(
-            lambda _: future.result(), scheduler_output)
 
-        engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output)
+        with self.tracer.log_event("wait_execute_model_output"):
+            model_output = self.execute_model_with_error_logging(
+                lambda _: future.result(), scheduler_output)
 
+        with self.tracer.log_event("scheduler_update_from_output"):
+            engine_core_outputs = self.scheduler.update_from_output(
+                scheduler_output, model_output)
+
+        self.tracer.save(output_file=f"engine_{time.time()}_trace.json")
         return engine_core_outputs, model_executed
 
     def shutdown(self):

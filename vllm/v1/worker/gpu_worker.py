@@ -40,6 +40,8 @@ if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.core.sched.output import SchedulerOutput
 
+from viztracer import VizTracer, get_tracer
+import time
 
 class Worker(WorkerBase):
 
@@ -93,6 +95,13 @@ class Worker(WorkerBase):
                     torch_profiler_trace_dir, use_gzip=True))
         else:
             self.profiler = None
+
+        logger.info(f"init gpu worker for rank {rank}")
+        self.tracer = VizTracer(include_files=["*vllm*"],
+                                # ignore_c_function=True,
+                                # ignore_frozen=True
+                                )
+        self.tracer.start()
 
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
@@ -359,13 +368,24 @@ class Worker(WorkerBase):
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         if forward_pass and not get_pp_group().is_first_rank:
-            intermediate_tensors = IntermediateTensors(
-                get_pp_group().recv_tensor_dict(
-                    all_gather_group=get_tp_group()))
+            with self.tracer.log_event("recv_tensor_dict"):
+                intermediate_tensors = IntermediateTensors(
+                    get_pp_group().recv_tensor_dict(
+                        all_gather_group=get_tp_group()))
 
-        output = self.model_runner.execute_model(scheduler_output,
-                                                 intermediate_tensors)
+        with self.tracer.log_event("model_runner_execute_model"):
+            output = self.model_runner.execute_model(scheduler_output,
+                                                     intermediate_tensors,
+                                                     self.tracer)
+            # if get_pp_group().is_first_rank:
+            #     output = IntermediateTensors({"test": torch.empty(190)})
+            #     output.kv_connector_output = None
+            #     logger.info(f"1===")
+            # else:
+            #     output = intermediate_tensors
+            #     logger.info(f"2===")
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput)):
+            self.tracer.save(output_file=f"worker_rank{self.rank}_{time.time()}_trace.json")
             return output
 
         assert isinstance(output, IntermediateTensors)
@@ -373,8 +393,13 @@ class Worker(WorkerBase):
         assert parallel_config.distributed_executor_backend != (
             "external_launcher") and not get_pp_group().is_last_rank
 
-        get_pp_group().send_tensor_dict(output.tensors,
-                                        all_gather_group=get_tp_group())
+        with self.tracer.log_event("send_tensor_dict"):
+            # logger.info(f"3===")
+            get_pp_group().send_tensor_dict(output.tensors,
+                                            all_gather_group=get_tp_group())
+            # logger.info(f"4===")
+
+        self.tracer.save(output_file=f"worker_rank{self.rank}_{time.time()}_trace.json")
 
         kv_connector_output = output.kv_connector_output
         if not kv_connector_output:

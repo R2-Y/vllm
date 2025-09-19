@@ -129,6 +129,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
                 'cpu', non_blocking=True)
             self._async_copy_ready_event.record()
 
+
     def get_output(self) -> ModelRunnerOutput:
         """Copy the device tensors to the host and return a ModelRunnerOutput.
         
@@ -1715,7 +1716,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     def _bookkeeping_sync(
         self, scheduler_output: "SchedulerOutput",
         sampler_output: SamplerOutput, logits: Optional[torch.Tensor],
-        hidden_states: torch.Tensor, num_scheduled_tokens: int
+        hidden_states: torch.Tensor, num_scheduled_tokens: int, tracer
     ) -> tuple[
             dict[str, int],
             Optional[LogprobsLists],
@@ -1760,10 +1761,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if logprobs_tensors is not None else None
 
         # Compute prompt logprobs if needed.
-        prompt_logprobs_dict = self._get_prompt_logprobs_dict(
-            hidden_states[:num_scheduled_tokens],
-            scheduler_output.num_scheduled_tokens,
-        )
+        with tracer.log_event("model runner _get_prompt_logprobs_dict"):
+            prompt_logprobs_dict = self._get_prompt_logprobs_dict(
+                hidden_states[:num_scheduled_tokens],
+                scheduler_output.num_scheduled_tokens,
+                tracer
+            )
 
         num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
         sampled_token_ids = sampler_output.sampled_token_ids
@@ -1771,18 +1774,22 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if not self.use_async_scheduling:
             # Get the valid generated tokens.
             max_gen_len = sampled_token_ids.shape[-1]
+            logger.info(f"sampled_token_ids {sampled_token_ids}")
             if max_gen_len == 1:
-                # No spec decode tokens.
-                valid_sampled_token_ids = self._to_list(sampled_token_ids)
+                with tracer.log_event("_to_list"):
+                    # No spec decode tokens.
+                    valid_sampled_token_ids = self._to_list(sampled_token_ids)
             else:
-                # Includes spec decode tokens.
-                valid_sampled_token_ids = self.rejection_sampler.parse_output(
-                    sampled_token_ids,
-                    self.input_batch.vocab_size,
-                )
+                with tracer.log_event("rejection_sampler parse_output"):
+                    # Includes spec decode tokens.
+                    valid_sampled_token_ids = self.rejection_sampler.parse_output(
+                        sampled_token_ids,
+                        self.input_batch.vocab_size,
+                    )
             # Mask out the sampled tokens that should not be sampled.
-            for i in discard_sampled_tokens_req_indices:
-                valid_sampled_token_ids[i].clear()
+            with tracer.log_event("clear valid_sampled_token_ids"):
+                for i in discard_sampled_tokens_req_indices:
+                    valid_sampled_token_ids[i].clear()
         else:
             valid_sampled_token_ids = []
             invalid_req_indices = list(discard_sampled_tokens_req_indices)
@@ -1808,30 +1815,31 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # the sampled tokens back, because there's no direct communication
         # between the first-stage worker and the last-stage worker.
         req_ids = self.input_batch.req_ids
-        for req_idx in range(num_sampled_tokens):
-            if self.use_async_scheduling:
-                sampled_ids = [-1] if \
-                    req_idx not in invalid_req_indices_set else None
-            else:
-                sampled_ids = valid_sampled_token_ids[req_idx]
-            if not sampled_ids:
-                continue
+        with tracer.log_event("cache the sampled tokens"):
+            for req_idx in range(num_sampled_tokens):
+                if self.use_async_scheduling:
+                    sampled_ids = [-1] if \
+                        req_idx not in invalid_req_indices_set else None
+                else:
+                    sampled_ids = valid_sampled_token_ids[req_idx]
+                if not sampled_ids:
+                    continue
 
-            start_idx = self.input_batch.num_tokens_no_spec[req_idx]
-            end_idx = start_idx + len(sampled_ids)
-            assert end_idx <= self.max_model_len, (
-                "Sampled token IDs exceed the max model length. "
-                f"Total number of tokens: {end_idx} > max_model_len: "
-                f"{self.max_model_len}")
+                start_idx = self.input_batch.num_tokens_no_spec[req_idx]
+                end_idx = start_idx + len(sampled_ids)
+                assert end_idx <= self.max_model_len, (
+                    "Sampled token IDs exceed the max model length. "
+                    f"Total number of tokens: {end_idx} > max_model_len: "
+                    f"{self.max_model_len}")
 
-            self.input_batch.token_ids_cpu[req_idx,
-                                           start_idx:end_idx] = sampled_ids
-            self.input_batch.num_tokens_no_spec[req_idx] = end_idx
-            self.input_batch.num_tokens[req_idx] = end_idx
+                self.input_batch.token_ids_cpu[req_idx,
+                                               start_idx:end_idx] = sampled_ids
+                self.input_batch.num_tokens_no_spec[req_idx] = end_idx
+                self.input_batch.num_tokens[req_idx] = end_idx
 
-            req_id = req_ids[req_idx]
-            req_state = self.requests[req_id]
-            req_state.output_token_ids.extend(sampled_ids)
+                req_id = req_ids[req_idx]
+                req_state = self.requests[req_id]
+                req_state.output_token_ids.extend(sampled_ids)
 
         return (
             num_nans_in_logits,
@@ -1848,36 +1856,52 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
+        tracer: Optional = None
     ) -> Union[ModelRunnerOutput, AsyncModelRunnerOutput, IntermediateTensors]:
         with record_function_or_nullcontext("Preprocess"):
-            self._update_states(scheduler_output)
+            with tracer.log_event("UPDATE STATES"):
+                self._update_states(scheduler_output)
             if not scheduler_output.total_num_scheduled_tokens:
                 if not has_kv_transfer_group():
                     # Return empty ModelRunnerOutput if there's no work to do.
                     return EMPTY_MODEL_RUNNER_OUTPUT
-                return self.kv_connector_no_forward(scheduler_output,
+                with tracer.log_event("KV CONNECTOR NO FORWARD"):
+                    return self.kv_connector_no_forward(scheduler_output,
                                                     self.vllm_config)
             if self.cache_config.kv_sharing_fast_prefill:
                 assert not self.input_batch.num_prompt_logprobs, (
                     "--kv-sharing-fast-prefill produces incorrect logprobs for "
                     "prompt tokens, tokens, please disable it when the requests"
                     " need prompt logprobs")
-
+            # is_last_chunk = True
+            # if len(scheduler_output.scheduled_new_reqs) > 0:
+            #     is_last_chunk = len(scheduler_output.scheduled_new_reqs[0].prompt_token_ids) - \
+            #                     scheduler_output.scheduled_new_reqs[0].num_computed_tokens <= 4096
+            #     logger.info(
+            #         f"scheduler_output.scheduled_new_reqs[0].prompt_token_ids {len(scheduler_output.scheduled_new_reqs[0].prompt_token_ids)}, "
+            #         f"scheduler_output.scheduled_new_reqs[0].num_computed_tokens {scheduler_output.scheduled_new_reqs[0].num_computed_tokens}")
+            # elif len(scheduler_output.scheduled_cached_reqs.req_ids) > 0:
+            #     is_last_chunk = 32244 - scheduler_output.scheduled_cached_reqs.num_computed_tokens[0] <= 4096
+            #     logger.info(f"scheduler_output.scheduled_cached_reqs.new_token_ids[0] {len(scheduler_output.scheduled_cached_reqs.new_token_ids)}, \n"
+            #                 f"scheduler_output.scheduled_cached_reqs.num_computed_tokens[0] {scheduler_output.scheduled_cached_reqs.num_computed_tokens[0]}")
+            # logger.info(f"is_last_chunk {is_last_chunk}")
             # Prepare the decoder inputs.
-            (attn_metadata, logits_indices, spec_decode_metadata,
-             num_scheduled_tokens_np, spec_decode_common_attn_metadata,
-             max_query_len) = self._prepare_inputs(scheduler_output)
+            with tracer.log_event("PRAPARE INPUTS"):
+                (attn_metadata, logits_indices, spec_decode_metadata,
+                 num_scheduled_tokens_np, spec_decode_common_attn_metadata,
+                 max_query_len) = self._prepare_inputs(scheduler_output)
 
-            (
-                num_scheduled_tokens,
-                num_input_tokens,
-                num_tokens_across_dp,
-                input_ids,
-                inputs_embeds,
-                positions,
-                intermediate_tensors,
-                model_kwargs,
-            ) = self._preprocess(scheduler_output, intermediate_tensors)
+            with tracer.log_event("PREPROCESS"):
+                (
+                    num_scheduled_tokens,
+                    num_input_tokens,
+                    num_tokens_across_dp,
+                    input_ids,
+                    inputs_embeds,
+                    positions,
+                    intermediate_tensors,
+                    model_kwargs,
+                ) = self._preprocess(scheduler_output, intermediate_tensors)
 
             uniform_decode = (max_query_len
                               == self.uniform_decode_query_len) and (
@@ -1885,8 +1909,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                   == self.input_batch.num_reqs * max_query_len)
             batch_descriptor = BatchDescriptor(num_tokens=num_input_tokens,
                                                uniform_decode=uniform_decode)
-            cudagraph_runtime_mode, batch_descriptor = \
-                self.cudagraph_dispatcher.dispatch(batch_descriptor)
+            with tracer.log_event("model runner dispatch"):
+                cudagraph_runtime_mode, batch_descriptor = \
+                    self.cudagraph_dispatcher.dispatch(batch_descriptor)
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
@@ -1900,92 +1925,121 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         ), record_function_or_nullcontext("Forward"),
               self.maybe_get_kv_connector_output(scheduler_output) as
               kv_connector_output):
-            model_output = self.model(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
-
-        with record_function_or_nullcontext("Postprocess"):
-            if self.use_aux_hidden_state_outputs:
-                hidden_states, aux_hidden_states = model_output
-            else:
-                hidden_states = model_output
-                aux_hidden_states = None
-
-            # Broadcast PP output for external_launcher (torchrun)
-            # to make sure we are synced across pp ranks
-            # TODO: Support overlapping mirco-batches
-            # https://github.com/vllm-project/vllm/issues/18019
-            broadcast_pp_output = \
-                self.parallel_config.distributed_executor_backend \
-                == "external_launcher" and len(get_pp_group().ranks) > 0
-            if not get_pp_group().is_last_rank:
-                # For mid-pipeline stages, return the hidden states.
-                assert isinstance(hidden_states, IntermediateTensors)
-                if not broadcast_pp_output:
-                    hidden_states.kv_connector_output = kv_connector_output
-                    return hidden_states
-                get_pp_group().send_tensor_dict(
-                    hidden_states.tensors, all_gather_group=get_tp_group())
-                logits = None
-            else:
-                if self.is_pooling_model:
-                    return self._pool(hidden_states, num_scheduled_tokens,
-                                      num_scheduled_tokens_np,
-                                      kv_connector_output)
-
-                sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states, None)
-            if broadcast_pp_output:
-                model_output_broadcast_data = {
-                    "logits": logits.contiguous(),
-                } if logits is not None else {}
-                model_output_broadcast_data = get_pp_group(
-                ).broadcast_tensor_dict(model_output_broadcast_data,
-                                        src=len(get_pp_group().ranks) - 1)
-                assert model_output_broadcast_data is not None
-                logits = model_output_broadcast_data["logits"]
-
-            # Apply structured output bitmasks if present
-            if scheduler_output.grammar_bitmask is not None:
-                self.apply_grammar_bitmask(scheduler_output, logits)
-
-        with record_function_or_nullcontext("Sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
-
-        with record_function_or_nullcontext("Bookkeep"):
-            assert isinstance(hidden_states, torch.Tensor)
-            (
-                num_nans_in_logits,
-                logprobs_lists,
-                valid_sampled_token_ids,
-                prompt_logprobs_dict,
-                req_ids_output_copy,
-                req_id_to_index_output_copy,
-                invalid_req_indices,
-            ) = self._bookkeeping_sync(scheduler_output, sampler_output,
-                                       logits, hidden_states,
-                                       num_scheduled_tokens)
-
-        if self.speculative_config:
-            assert spec_decode_common_attn_metadata is not None
-            with record_function_or_nullcontext("Draft"):
-                self._draft_token_ids = self.propose_draft_token_ids(
-                    scheduler_output,
-                    valid_sampled_token_ids,
-                    self.input_batch.sampling_metadata,
-                    hidden_states,
-                    sample_hidden_states,
-                    aux_hidden_states,
-                    spec_decode_metadata,
-                    spec_decode_common_attn_metadata,
+            with tracer.log_event("Forward"):
+                model_output = self.model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
                 )
 
+        with record_function_or_nullcontext("Postprocess"):
+            with tracer.log_event("Postprocess"):
+                if self.use_aux_hidden_state_outputs:
+                    hidden_states, aux_hidden_states = model_output
+                else:
+                    hidden_states = model_output
+                    aux_hidden_states = None
+
+                # Broadcast PP output for external_launcher (torchrun)
+                # to make sure we are synced across pp ranks
+                # TODO: Support overlapping mirco-batches
+                # https://github.com/vllm-project/vllm/issues/18019
+                broadcast_pp_output = \
+                    self.parallel_config.distributed_executor_backend \
+                    == "external_launcher" and len(get_pp_group().ranks) > 0
+                if not get_pp_group().is_last_rank:
+                    # For mid-pipeline stages, return the hidden states.
+                    assert isinstance(hidden_states, IntermediateTensors)
+                    if not broadcast_pp_output:
+                        hidden_states.kv_connector_output = kv_connector_output
+                        return hidden_states
+                    with tracer.log_event("model runner send_tensor_dict"):
+                        get_pp_group().send_tensor_dict(
+                            hidden_states.tensors, all_gather_group=get_tp_group())
+                    logits = None
+                else:
+                    # if is_last_chunk:
+                    if self.is_pooling_model:
+                        with tracer.log_event("model runner _pool"):
+                            return self._pool(hidden_states, num_scheduled_tokens,
+                                              num_scheduled_tokens_np,
+                                              kv_connector_output)
+
+                    sample_hidden_states = hidden_states[logits_indices]
+                    with tracer.log_event("model runner compute_logits"):
+                        logits = self.model.compute_logits(sample_hidden_states, None)
+                    # else:
+                    #     logits = None
+
+                if broadcast_pp_output:
+                    model_output_broadcast_data = {
+                        "logits": logits.contiguous(),
+                    } if logits is not None else {}
+                    with tracer.log_event("model runner broadcast_tensor_dict"):
+                        model_output_broadcast_data = get_pp_group(
+                        ).broadcast_tensor_dict(model_output_broadcast_data,
+                                                src=len(get_pp_group().ranks) - 1)
+                    assert model_output_broadcast_data is not None
+                    logits = model_output_broadcast_data["logits"]
+
+                # if is_last_chunk:
+                # Apply structured output bitmasks if present
+                if scheduler_output.grammar_bitmask is not None:
+                    with tracer.log_event("model runner apply_grammar_bitmask"):
+                        self.apply_grammar_bitmask(scheduler_output, logits)
+
+        # if is_last_chunk:
+        with record_function_or_nullcontext("Sample"):
+            with tracer.log_event("Sample"):
+                sampler_output = self._sample(logits, spec_decode_metadata)
+
+        with record_function_or_nullcontext("Bookkeep"):
+            with tracer.log_event("Bookkeep"):
+                assert isinstance(hidden_states, torch.Tensor)
+                (
+                    num_nans_in_logits,
+                    logprobs_lists,
+                    valid_sampled_token_ids,
+                    prompt_logprobs_dict,
+                    req_ids_output_copy,
+                    req_id_to_index_output_copy,
+                    invalid_req_indices,
+                ) = self._bookkeeping_sync(scheduler_output, sampler_output,
+                                           logits, hidden_states,
+                                           num_scheduled_tokens, tracer)
+
+            if self.speculative_config:
+                assert spec_decode_common_attn_metadata is not None
+                with record_function_or_nullcontext("Draft"):
+                    with tracer.log_event("Draft"):
+                        self._draft_token_ids = self.propose_draft_token_ids(
+                            scheduler_output,
+                            valid_sampled_token_ids,
+                            self.input_batch.sampling_metadata,
+                            hidden_states,
+                            sample_hidden_states,
+                            aux_hidden_states,
+                            spec_decode_metadata,
+                            spec_decode_common_attn_metadata,
+                        )
+
         with record_function_or_nullcontext("EPLB"):
-            self.eplb_step()
+            with tracer.log_event("EPLB"):
+                self.eplb_step()
+
+        # test:
+        # if not is_last_chunk:
+        #     req_ids_output_copy = self.input_batch.req_ids.copy()
+        #     req_id_to_index_output_copy = \
+        #         self.input_batch.req_id_to_index.copy()
+        #     valid_sampled_token_ids = []
+        #     logprobs_lists = []
+        #     prompt_logprobs_dict = {}
+        #     num_nans_in_logits = {}
+        #     if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
+        #         num_nans_in_logits = self._get_nans_in_logits(logits)
 
         output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
@@ -2290,9 +2344,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self,
         hidden_states: torch.Tensor,
         num_scheduled_tokens: dict[str, int],
+        tracer
     ) -> dict[str, Optional[LogprobsTensors]]:
         num_prompt_logprobs_dict = self.input_batch.num_prompt_logprobs
+        include_last_chunk = False
         if not num_prompt_logprobs_dict:
+            logger.info(f"_get_prompt_logprobs_dict test1")
             return {}
 
         in_progress_dict = self.input_batch.in_progress_prompt_logprobs_cpu
@@ -2347,7 +2404,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             req_idx = self.input_batch.req_id_to_index[req_id]
             offset = self.query_start_loc.np[req_idx].item()
             prompt_hidden_states = hidden_states[offset:offset + num_logits]
-            logits = self.model.compute_logits(prompt_hidden_states, None)
+            with tracer.log_event("model runner compute_logits"):
+                if num_tokens <= num_remaining_tokens: # not last chunk
+                    continue
+                else:
+                    logits = self.model.compute_logits(prompt_hidden_states, None)
 
             # Get the "target" tokens for each index. For prompt at index i,
             # the token at prompt index i+1 is the "sampled" token we want
@@ -2355,18 +2416,21 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             tgt_token_ids = prompt_token_ids[start_tok:start_tok + num_logits]
 
             # Compute prompt logprobs.
-            logprobs = self.sampler.compute_logprobs(logits)
-            token_ids, logprobs, ranks = self.sampler.gather_logprobs(
-                logprobs, num_prompt_logprobs, tgt_token_ids)
+            with tracer.log_event("model runner compute_logprobs"):
+                logprobs = self.sampler.compute_logprobs(logits)
+            with tracer.log_event("model runner gather_logprobs"):
+                token_ids, logprobs, ranks = self.sampler.gather_logprobs(
+                    logprobs, num_prompt_logprobs, tgt_token_ids)
 
             # Transfer GPU->CPU async.
-            chunk_slice = slice(start_idx, start_idx + num_logits)
-            logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
-                token_ids, non_blocking=True)
-            logprobs_tensors.logprobs[chunk_slice].copy_(logprobs,
-                                                         non_blocking=True)
-            logprobs_tensors.selected_token_ranks[chunk_slice].copy_(
-                ranks, non_blocking=True)
+            with tracer.log_event("GPU->CPU async"):
+                chunk_slice = slice(start_idx, start_idx + num_logits)
+                logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
+                    token_ids, non_blocking=True)
+                logprobs_tensors.logprobs[chunk_slice].copy_(logprobs,
+                                                             non_blocking=True)
+                logprobs_tensors.selected_token_ranks[chunk_slice].copy_(
+                    ranks, non_blocking=True)
 
         # Remove requests that have completed prefill from the batch
         # num_prompt_logprobs_dict.
@@ -2375,8 +2439,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             del in_progress_dict[req_id]
 
         # Must synchronize the non-blocking GPU->CPU transfers.
-        if prompt_logprobs_dict:
-            self._sync_device()
+        with tracer.log_event("_sync_device"):
+            if prompt_logprobs_dict:
+                self._sync_device()
 
         return prompt_logprobs_dict
 
@@ -3529,7 +3594,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         return kv_cache_spec
 
-    def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
+    def _to_list(self, sampled_token_ids: torch.Tensor, include_last_chunk: bool) -> list[list[int]]:
         # This is a short term mitigation for issue mentioned in
         # https://github.com/vllm-project/vllm/issues/22754.
         # `tolist` would trigger a cuda wise stream sync, which
