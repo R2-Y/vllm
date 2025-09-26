@@ -338,26 +338,27 @@ class EngineCore:
         assert len(batch_queue) < self.batch_queue_size
 
         model_executed = False
-        if self.scheduler.has_requests():
-            with self.tracer.log_event("scheduler_schedule"):
-                scheduler_output = self.scheduler.schedule()
-            with self.tracer.log_event("async_execute_model"):
-                future = self.model_executor.execute_model(scheduler_output)
-            batch_queue.appendleft(
-                (future, scheduler_output))  # type: ignore[arg-type]
+        with self.tracer.log_event("obtain future"):
+            if self.scheduler.has_requests():
+                with self.tracer.log_event("scheduler_schedule"):
+                    scheduler_output = self.scheduler.schedule()
+                with self.tracer.log_event("async_execute_model"):
+                    future = self.model_executor.execute_model(scheduler_output)
+                batch_queue.appendleft(
+                    (future, scheduler_output))  # type: ignore[arg-type]
 
-            model_executed = scheduler_output.total_num_scheduled_tokens > 0
-            if model_executed and len(batch_queue) < self.batch_queue_size \
-                and not batch_queue[-1][0].done():
-                # Don't block on next worker response unless the queue is full
-                # or there are no more requests to schedule.
-                return None, True
+                model_executed = scheduler_output.total_num_scheduled_tokens > 0
+                if model_executed and len(batch_queue) < self.batch_queue_size \
+                    and not batch_queue[-1][0].done():
+                    # Don't block on next worker response unless the queue is full
+                    # or there are no more requests to schedule.
+                    return None, True
 
-        elif not batch_queue:
-            # Queue is empty. We should not reach here since this method should
-            # only be called when the scheduler contains requests or the queue
-            # is non-empty.
-            return None, False
+            elif not batch_queue:
+                # Queue is empty. We should not reach here since this method should
+                # only be called when the scheduler contains requests or the queue
+                # is non-empty.
+                return None, False
 
         # Block until the next result is available.
         future, scheduler_output = batch_queue.pop()
@@ -748,7 +749,8 @@ class EngineCoreProc(EngineCore):
         # Loop until process is sent a SIGINT or SIGTERM
         while True:
             # 1) Poll the input queue until there is work to do.
-            self._process_input_queue()
+            with self.tracer.log_event("_process_input_queue"):
+                self._process_input_queue()
             # 2) Step the engine core and return the outputs.
             self._process_engine_step()
 
@@ -774,14 +776,15 @@ class EngineCoreProc(EngineCore):
 
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
-
         # Step the engine core.
         outputs, model_executed = self.step_fn()
-        # Put EngineCoreOutputs into the output queue.
-        for output in (outputs.items() if outputs else ()):
-            self.output_queue.put_nowait(output)
+        with self.tracer.log_event("put_outputs_into_queue"):
+            # Put EngineCoreOutputs into the output queue.
+            for output in (outputs.items() if outputs else ()):
+                self.output_queue.put_nowait(output)
         # Post-step hook.
-        self.post_step(model_executed)
+        with self.tracer.log_event("post_step"):
+            self.post_step(model_executed)
 
         return model_executed
 

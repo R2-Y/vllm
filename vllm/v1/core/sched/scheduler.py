@@ -211,6 +211,9 @@ class Scheduler(SchedulerInterface):
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
 
+        # chunked prefill
+        post_process_sync_flag: bool = False
+
         # For logging.
         scheduled_timestamp = time.monotonic()
 
@@ -357,6 +360,15 @@ class Scheduler(SchedulerInterface):
                 for i in encoder_inputs_to_schedule:
                     self.encoder_cache_manager.allocate(request, i)
                 encoder_compute_budget = new_encoder_compute_budget
+
+            # chunked_prefill
+            if len(request.prompt_token_ids) - request.num_computed_tokens <= self.max_num_scheduled_tokens:
+                post_process_sync_flag = True
+            logger.info(f"len(request.prompt_token_ids) {len(request.prompt_token_ids)}, "
+                        f"request.num_computed_tokens {request.num_computed_tokens}, "
+                        f"token_budget {self.max_num_scheduled_tokens}, "
+                        f"post_process_sync_flag {post_process_sync_flag}")
+
 
         # Record the LoRAs in scheduled_running_reqs
         scheduled_loras: set[int] = set()
@@ -586,6 +598,14 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.allocate(request, i)
                     encoder_compute_budget = new_encoder_compute_budget
 
+                # tell if it is last chunk
+                if len(request.prompt_token_ids) - request.num_computed_tokens <= self.max_num_scheduled_tokens:
+                    post_process_sync_flag = True
+                logger.info(f"len(request.prompt_token_ids) {len(request.prompt_token_ids)}, "
+                            f"request.num_computed_tokens {request.num_computed_tokens}, "
+                            f"chunk size {self.max_num_scheduled_tokens}, "
+                            f"post_process_sync_flag {post_process_sync_flag}")
+
         # Put back any skipped requests at the head of the waiting queue
         if skipped_waiting_requests:
             self.waiting.prepend_requests(skipped_waiting_requests)
@@ -644,6 +664,7 @@ class Scheduler(SchedulerInterface):
             get_freed_mm_hashes(),
             structured_output_request_ids=structured_output_request_ids,
             grammar_bitmask=grammar_bitmask,
+            post_process_sync_flag=post_process_sync_flag
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:

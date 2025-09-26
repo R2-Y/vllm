@@ -1777,8 +1777,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             logger.info(f"sampled_token_ids {sampled_token_ids}")
             if max_gen_len == 1:
                 with tracer.log_event("_to_list"):
+                    # if scheduler_output.post_process_sync_flag:
                     # No spec decode tokens.
                     valid_sampled_token_ids = self._to_list(sampled_token_ids)
+                    logger.info(f"valid_sampled_token_ids 1 {valid_sampled_token_ids}")
+                    # else:
+                    #     # valid_sampled_token_ids = torch.empty_like(sampled_token_ids)
+                    #     valid_sampled_token_ids = sampled_token_ids.cpu().tolist()
+                    #     logger.info(f"valid_sampled_token_ids 2 {valid_sampled_token_ids}")
             else:
                 with tracer.log_event("rejection_sampler parse_output"):
                     # Includes spec decode tokens.
@@ -1873,18 +1879,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     "--kv-sharing-fast-prefill produces incorrect logprobs for "
                     "prompt tokens, tokens, please disable it when the requests"
                     " need prompt logprobs")
-            # is_last_chunk = True
-            # if len(scheduler_output.scheduled_new_reqs) > 0:
-            #     is_last_chunk = len(scheduler_output.scheduled_new_reqs[0].prompt_token_ids) - \
-            #                     scheduler_output.scheduled_new_reqs[0].num_computed_tokens <= 4096
-            #     logger.info(
-            #         f"scheduler_output.scheduled_new_reqs[0].prompt_token_ids {len(scheduler_output.scheduled_new_reqs[0].prompt_token_ids)}, "
-            #         f"scheduler_output.scheduled_new_reqs[0].num_computed_tokens {scheduler_output.scheduled_new_reqs[0].num_computed_tokens}")
-            # elif len(scheduler_output.scheduled_cached_reqs.req_ids) > 0:
-            #     is_last_chunk = 32244 - scheduler_output.scheduled_cached_reqs.num_computed_tokens[0] <= 4096
-            #     logger.info(f"scheduler_output.scheduled_cached_reqs.new_token_ids[0] {len(scheduler_output.scheduled_cached_reqs.new_token_ids)}, \n"
-            #                 f"scheduler_output.scheduled_cached_reqs.num_computed_tokens[0] {scheduler_output.scheduled_cached_reqs.num_computed_tokens[0]}")
-            # logger.info(f"is_last_chunk {is_last_chunk}")
             # Prepare the decoder inputs.
             with tracer.log_event("PRAPARE INPUTS"):
                 (attn_metadata, logits_indices, spec_decode_metadata,
@@ -1952,6 +1946,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 if not get_pp_group().is_last_rank:
                     # For mid-pipeline stages, return the hidden states.
                     assert isinstance(hidden_states, IntermediateTensors)
+                    # sync cuda each pipeline stage to ensure pipeline parallel
+                    # if scheduler_output.post_process_sync_flag:
+                    self.transfer_event.record()
+                    self.transfer_event.synchronize()
+                    #     logger.info(f"non last pp stage sync")
                     if not broadcast_pp_output:
                         hidden_states.kv_connector_output = kv_connector_output
                         return hidden_states
@@ -1960,7 +1959,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                             hidden_states.tensors, all_gather_group=get_tp_group())
                     logits = None
                 else:
-                    # if is_last_chunk:
+                    # if scheduler_output.post_process_sync_flag:
                     if self.is_pooling_model:
                         with tracer.log_event("model runner _pool"):
                             return self._pool(hidden_states, num_scheduled_tokens,
@@ -1973,6 +1972,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     # else:
                     #     logits = None
 
+                # if scheduler_output.post_process_sync_flag:
                 if broadcast_pp_output:
                     model_output_broadcast_data = {
                         "logits": logits.contiguous(),
@@ -1984,13 +1984,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     assert model_output_broadcast_data is not None
                     logits = model_output_broadcast_data["logits"]
 
-                # if is_last_chunk:
                 # Apply structured output bitmasks if present
                 if scheduler_output.grammar_bitmask is not None:
                     with tracer.log_event("model runner apply_grammar_bitmask"):
                         self.apply_grammar_bitmask(scheduler_output, logits)
 
-        # if is_last_chunk:
+        # if scheduler_output.post_process_sync_flag:
         with record_function_or_nullcontext("Sample"):
             with tracer.log_event("Sample"):
                 sampler_output = self._sample(logits, spec_decode_metadata)
@@ -2010,27 +2009,27 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                            logits, hidden_states,
                                            num_scheduled_tokens, tracer)
 
-            if self.speculative_config:
-                assert spec_decode_common_attn_metadata is not None
-                with record_function_or_nullcontext("Draft"):
-                    with tracer.log_event("Draft"):
-                        self._draft_token_ids = self.propose_draft_token_ids(
-                            scheduler_output,
-                            valid_sampled_token_ids,
-                            self.input_batch.sampling_metadata,
-                            hidden_states,
-                            sample_hidden_states,
-                            aux_hidden_states,
-                            spec_decode_metadata,
-                            spec_decode_common_attn_metadata,
-                        )
+        if self.speculative_config:
+            assert spec_decode_common_attn_metadata is not None
+            with record_function_or_nullcontext("Draft"):
+                with tracer.log_event("Draft"):
+                    self._draft_token_ids = self.propose_draft_token_ids(
+                        scheduler_output,
+                        valid_sampled_token_ids,
+                        self.input_batch.sampling_metadata,
+                        hidden_states,
+                        sample_hidden_states,
+                        aux_hidden_states,
+                        spec_decode_metadata,
+                        spec_decode_common_attn_metadata,
+                    )
 
         with record_function_or_nullcontext("EPLB"):
             with tracer.log_event("EPLB"):
                 self.eplb_step()
 
         # test:
-        # if not is_last_chunk:
+        # if not scheduler_output.post_process_sync_flag:
         #     req_ids_output_copy = self.input_batch.req_ids.copy()
         #     req_id_to_index_output_copy = \
         #         self.input_batch.req_id_to_index.copy()
@@ -2347,7 +2346,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         tracer
     ) -> dict[str, Optional[LogprobsTensors]]:
         num_prompt_logprobs_dict = self.input_batch.num_prompt_logprobs
-        include_last_chunk = False
         if not num_prompt_logprobs_dict:
             logger.info(f"_get_prompt_logprobs_dict test1")
             return {}
@@ -3594,7 +3592,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         return kv_cache_spec
 
-    def _to_list(self, sampled_token_ids: torch.Tensor, include_last_chunk: bool) -> list[list[int]]:
+    def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
         # This is a short term mitigation for issue mentioned in
         # https://github.com/vllm-project/vllm/issues/22754.
         # `tolist` would trigger a cuda wise stream sync, which

@@ -155,3 +155,6 @@ class SchedulerOutput:
 
     # KV Cache Connector metadata.
     kv_connector_metadata: Optional[KVConnectorMetadata] = None
+
+    # use for chunked prefill
+    post_process_sync_flag: Optional[bool] = False

@@ -57,6 +57,33 @@ elif [[ $1 == "decoder" ]]; then
         --kv-transfer-config \
         '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_consumer","kv_connector_extra_config": {"discard_partial_chunks": false, "lmcache_rpc_port": "consumer1"}}'
 
+elif [[ $1 == "mix" ]]; then
+#     mix_config_file=$SCRIPT_DIR/configs/lmcache-mix-config.yaml
+     UCX_TLS=cuda_ipc,cuda_copy,tcp \
+#        LMCACHE_CONFIG_FILE=mix_config_file \
+#        LMCACHE_USE_EXPERIMENTAL=True \
+        VLLM_ENABLE_V1_MULTIPROCESSING=1 \
+        VLLM_WORKER_MULTIPROC_METHOD=spawn \
+        LLM_LOGGING_LEVEL=DEBUG \
+        VLLM_TORCH_PROFILER_DIR=/workspace/yrr/vllm/examples/others/lmcache/disagg_prefill_lmcache_v1 \
+        CUDA_VISIBLE_DEVICES=4,5,6,7 \
+        vllm serve $MODEL \
+        -tp 1 \
+        -pp 4 \
+        --port 8300 \
+        --disable-log-requests \
+        --enforce-eager \
+        --no-enable-prefix-caching \
+        --max-num-batched-tokens 4096\
+        --gpu-memory-utilization 0.7\
+        --enable_dcpp \
+        --dcpp_min_chunk 128\
+        --dcpp_length_threshold 2048\
+
+#        --async-scheduling \
+
+#        --kv-transfer-config \
+#        '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}'
 
 else
     echo "Invalid role: $1"
