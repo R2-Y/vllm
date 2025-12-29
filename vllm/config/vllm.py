@@ -800,10 +800,6 @@ class VllmConfig:
                         "Async scheduling is not compatible with "
                         "disable_padded_drafter_batch=True."
                     )
-            if not executor_supports_async_sched:
-                raise ValueError(
-                    f"`{executor_backend}` does not support async scheduling yet."
-                )
         elif self.scheduler_config.async_scheduling is None:
             # Enable async scheduling unless there is an incompatible option.
             if (
@@ -836,13 +832,7 @@ class VllmConfig:
                     "disable_padded_drafter_batch=True and will be disabled.",
                 )
                 self.scheduler_config.async_scheduling = False
-            elif not executor_supports_async_sched:
-                logger.warning_once(
-                    "Async scheduling will be disabled because it is not supported "
-                    "with the `%s` distributed executor backend. ",
-                    executor_backend,
-                )
-                self.scheduler_config.async_scheduling = False
+<<<<<<< HEAD
             else:
                 self.scheduler_config.async_scheduling = True
 
