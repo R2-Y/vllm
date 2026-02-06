@@ -180,6 +180,7 @@ try:
                 self._execute_model_outputs.append(output)
                 return None
 
+            assert not isinstance(output, AsyncModelRunnerOutput)
             return output
 
         def get_execute_model_output(
@@ -290,7 +291,7 @@ class FutureWrapper(Future):
         return self.ref_or_refs
 
     def result(self, timeout=None):
-        outputs = ray.get(self.get_refs(), timeout=timeout)
+        outputs = ray.get(self.get_refs(timeout), timeout=timeout)
         if self.aggregator is None:
             detach_zero_copy_from_model_runner_output(outputs)
             return outputs
