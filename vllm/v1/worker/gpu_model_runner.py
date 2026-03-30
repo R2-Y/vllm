@@ -3827,6 +3827,7 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        logger.info("execute_model, scheduler_output: %s, pp rank: %s", scheduler_output, get_pp_group().rank)
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -4183,6 +4184,7 @@ class GPUModelRunner(
             self.kv_connector_output = None
             # receive sampled token ids from the last PP rank.
             if self.use_async_scheduling and get_pp_group().world_size > 1:
+                logger.info("0 receive sampled token ids from the last PP rank. pp rank: %s", get_pp_group().rank)
                 self._pp_receive_prev_sampled_token_ids_to_input_batch()
             if not kv_connector_output:
                 return None  # type: ignore[return-value]
@@ -4416,7 +4418,15 @@ class GPUModelRunner(
     def _pp_broadcast_prev_sampled_token_ids(
         self, sampled_token_ids: torch.Tensor
     ) -> None:
-        """Broadcast sampled token ids (GPU) from last PP stage"""
+        """Send sampled token ids (GPU) from last PP stage to all non-last stages.
+
+        Uses P2P isend (one per non-last rank) instead of a group broadcast.
+        A group broadcast requires ALL ranks to call it simultaneously, which is
+        impossible in the Ray compiled-DAG pipeline where each stage runs
+        independently.  P2P matching is per (src, dst) pair, so each
+        non-last rank can post its recv whenever it is ready — no global
+        synchronisation needed.
+        """
         pp = get_pp_group()
         assert pp.is_last_rank
         # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
@@ -4425,21 +4435,45 @@ class GPUModelRunner(
         )
         # Skip for chunked prefill: sampled tokens are dummy
         # and will be discarded, no need to broadcast.
-        if not self._is_all_reqs_chunked_prefill():
+        if self._is_all_reqs_chunked_prefill():
+            return
+
+        if self.parallel_config.distributed_executor_backend != "ray":
             torch.distributed.broadcast(
                 sampled_token_ids, src=pp.rank, group=pp.device_group
             )
+            return
+
+        # Ray compiled-DAG stages run independently, so group-wide broadcast
+        # can deadlock when ranks are not synchronized at this point.
+        works = []
+        for rank_in_group in range(pp.world_size - 1):
+            dst_global_rank = pp.ranks[rank_in_group]
+            work = torch.distributed.isend(
+                sampled_token_ids.clone(),
+                dst=dst_global_rank,
+                group=pp.device_group,
+            )
+            works.append(work)
+        # Keep work handles alive until NCCL transfer is done.
+        self._pp_send_works = works
 
     def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
-        """Receive sampled token ids broadcast from last PP stage"""
+        """Receive sampled token ids sent from the last PP stage (P2P recv)."""
         pp = get_pp_group()
         assert not pp.is_last_rank
         num_reqs = self.input_batch.num_reqs
         # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
         recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
-        # skip for chunked prefill.
-        if not self._is_all_reqs_chunked_prefill():
+        # Skip collective communication for chunked prefill. This path does
+        # not consume sampled token ids, but we still keep downstream state
+        # updates below consistent.
+        if self._is_all_reqs_chunked_prefill():
+            recv.zero_()
+        elif self.parallel_config.distributed_executor_backend != "ray":
             torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
+        else:
+            torch.distributed.recv(recv, src=pp.last_rank, group=pp.device_group)
         self.input_batch.prev_sampled_token_ids = recv
 
         # construct `prev_req_id_to_index` here so `_prepare_input_ids`
