@@ -3827,6 +3827,7 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        logger.info("execute_model, scheduler_output: %s, pp rank: %s", scheduler_output, get_pp_group().rank)
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -4448,10 +4449,13 @@ class GPUModelRunner(
         works = []
         for rank_in_group in range(pp.world_size - 1):
             dst_global_rank = pp.ranks[rank_in_group]
+            sampled_token_group = self._get_pp_sampled_token_send_group(
+                dst_global_rank
+            )
             work = torch.distributed.isend(
                 sampled_token_ids.clone(),
                 dst=dst_global_rank,
-                group=pp.device_group,
+                group=sampled_token_group,
             )
             works.append(work)
         # Keep work handles alive until NCCL transfer is done.
@@ -4472,7 +4476,10 @@ class GPUModelRunner(
         elif self.parallel_config.distributed_executor_backend != "ray":
             torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
         else:
-            torch.distributed.recv(recv, src=pp.last_rank, group=pp.device_group)
+            sampled_token_group = self._get_pp_sampled_token_recv_group()
+            torch.distributed.recv(
+                recv, src=pp.last_rank, group=sampled_token_group
+            )
         self.input_batch.prev_sampled_token_ids = recv
 
         # construct `prev_req_id_to_index` here so `_prepare_input_ids`
