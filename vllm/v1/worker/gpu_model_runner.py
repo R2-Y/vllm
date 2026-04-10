@@ -479,6 +479,15 @@ class GPUModelRunner(
         # Async scheduling
         self.use_async_scheduling = self.scheduler_config.async_scheduling
 
+        # Pending irecv state for deferred PP sampled-token sync.
+        # Set by ray_utils.execute_model_ray() and consumed inside
+        # execute_model() just before _prepare_inputs() so that Stage 0 can
+        # overlap CPU pre-processing (_update_states, buffer allocation) with
+        # Stages 1-N of the previous batch, narrowing the blocking window.
+        self._pending_pp_irecv: (
+            tuple[Any, torch.Tensor, dict[str, int]] | None
+        ) = None
+        
         # Sampler
         self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
 
@@ -3911,6 +3920,19 @@ class GPUModelRunner(
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
+            # Deferred PP irecv completion: waiting here (rather than at the
+            # top of execute_model_ray) lets Stage 0 overlap CPU preprocessing
+            # — _update_states, buffer allocation — with Stages 1-N running the
+            # previous batch's forward pass. The blocking window is now as short
+            # as possible: we only stall until the last rank's isend fires, and
+            # only right before the GPU kernel that needs prev_sampled_token_ids.
+            if self._pending_pp_irecv is not None:
+                work, recv_buf, prev_req_id_to_index = self._pending_pp_irecv
+                self._pending_pp_irecv = None
+                work.wait()
+                self.input_batch.prev_sampled_token_ids = recv_buf
+                self.input_batch.prev_req_id_to_index = prev_req_id_to_index
+
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
                 num_scheduled_tokens_np,
@@ -4497,6 +4519,99 @@ class GPUModelRunner(
                 req_state.output_token_ids.append(-1)
         self.input_batch.prev_req_id_to_index = prev_req_id_to_index
 
+<<<<<<< HEAD
+=======
+    def _pp_post_irecv(
+        self,
+    ) -> tuple[Any, torch.Tensor, dict[str, int]]:
+        """Post a non-blocking recv for next-step sampled token IDs."""
+        pp = get_pp_group()
+        sampled_token_group = self._get_pp_sampled_token_recv_group()
+        assert not pp.is_last_rank
+
+        num_reqs = self.input_batch.num_reqs
+        recv_buf = torch.empty(
+            (num_reqs, 1), dtype=torch.int32, device=self.device
+        )
+        work = torch.distributed.irecv(
+            recv_buf, src=pp.last_rank, group=sampled_token_group
+        )
+
+        discard_req_indices = np.nonzero(
+            self.discard_request_mask.np[:num_reqs]
+        )[0]
+        discard_req_indices_set = set(discard_req_indices)
+        prev_req_id_to_index: dict[str, int] = {}
+        for i, req_id in enumerate(self.input_batch.req_ids):
+            if i in discard_req_indices_set:
+                continue
+            prev_req_id_to_index[req_id] = i
+            if (req_state := self.requests.get(req_id)) is not None:
+                req_state.output_token_ids.append(-1)
+
+        return work, recv_buf, prev_req_id_to_index
+
+    # def _pp_complete_irecv(
+    #     self,
+    #     work: Any,
+    #     recv_buf: torch.Tensor,
+    #     prev_req_id_to_index: dict[str, int],
+    # ) -> None:
+    #     """Finish a previously-posted sampled-token recv."""
+    #     work.wait()
+    #     self.input_batch.prev_sampled_token_ids = recv_buf
+    #     self.input_batch.prev_req_id_to_index = prev_req_id_to_index
+
+    def _get_pp_sampled_token_send_group(self, dst_global_rank: int):
+        pp = get_pp_group()
+        assert pp.is_last_rank
+        return self.pp_sampled_token_send_groups.get(
+            dst_global_rank, pp.device_group)
+
+    def _get_pp_sampled_token_recv_group(self):
+        pp = get_pp_group()
+        assert not pp.is_last_rank
+        return self.pp_sampled_token_recv_group or pp.device_group
+
+    def _warmup_pp_sampled_token_groups(self) -> None:
+        """Force NCCL pair-group initialization before the first user request.
+
+        Without this, the very first sampled-token send/recv on a freshly
+        created pairwise group may trigger lazy NCCL communicator setup on the
+        request critical path and hang in the Ray+PP pipeline.
+        """
+        pp = get_pp_group()
+        if pp.world_size <= 1 or self.broadcast_pp_output:
+            return
+
+        warmup_tensor = torch.zeros(1, dtype=torch.int32, device=self.device)
+        if pp.is_last_rank:
+            for peer_global_rank, group in self.pp_sampled_token_send_groups.items():
+                work = torch.distributed.isend(
+                    warmup_tensor.clone(),
+                    dst=peer_global_rank,
+                    group=group,
+                )
+                work.wait()
+        else:
+            group = self._get_pp_sampled_token_recv_group()
+            recv = torch.empty(1, dtype=torch.int32, device=self.device)
+            torch.distributed.recv(recv, src=pp.last_rank, group=group)
+
+        # Make sure all PP ranks have finished the warmup before serving.
+        get_pp_group().barrier()
+
+    def shutdown(self) -> None:
+        seen_groups = set()
+        if self.pp_sampled_token_recv_group is not None:
+            seen_groups.add(self.pp_sampled_token_recv_group)
+        seen_groups.update(self.pp_sampled_token_send_groups.values())
+        for group in seen_groups:
+            torch.distributed.destroy_process_group(group)
+        self.pp_sampled_token_recv_group = None
+        self.pp_sampled_token_send_groups.clear()
+
+>>>>>>> 2ac5e27b7 (Defer async PP sampled-token irecv completion into GPUModelRunner.execute_model() to overlap stage-0 CPU preprocessing with prior-stage execution)
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if not self.num_spec_tokens or not self._draft_token_req_ids:
             return None
