@@ -24,10 +24,8 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.engine import ReconfigureDistributedRequest, ReconfigureRankType
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.executor.ray_utils import (
-    WORKER_SPECIFIC_ENV_VARS,
     FutureWrapper,
     RayWorkerWrapper,
-    detach_zero_copy_from_model_runner_output,
     initialize_ray_cluster,
     ray,
 )
@@ -65,12 +63,24 @@ class RayWorkerMetaData:
 class RayDistributedExecutor(Executor):
     """Ray-based distributed executor"""
 
+    # These env vars are worker-specific, therefore are NOT copied
+    # from the driver to the workers
+    WORKER_SPECIFIC_ENV_VARS = {
+        "VLLM_HOST_IP",
+        "VLLM_HOST_PORT",
+        "LOCAL_RANK",
+        "CUDA_VISIBLE_DEVICES",
+        "HIP_VISIBLE_DEVICES",
+        "ROCR_VISIBLE_DEVICES",
+    }
+
     uses_ray: bool = True
     supports_pp: bool = True
 
     def _init_executor(self) -> None:
         self.forward_dag: ray.dag.CompiledDAG | None = None
         self._pp_async_step_id = 0
+        self.tracer = None
 
         # For TPU or XPU, avoid compiling NVIDIA's NCCL
         if current_platform.is_tpu() or current_platform.is_xpu():
@@ -123,6 +133,9 @@ class RayDistributedExecutor(Executor):
             for worker in self.workers:
                 ray.kill(worker)
             self.forward_dag = None
+
+    def checkpoint_trace(self) -> None:
+        self.collective_rpc("checkpoint_trace")
 
     def _configure_ray_workers_use_nsight(self, ray_remote_kwargs) -> dict[str, Any]:
         # If nsight profiling is enabled, we need to set the profiling
@@ -330,7 +343,7 @@ class RayDistributedExecutor(Executor):
 
         # Environment variables to copy from driver to workers
         env_vars_to_copy = get_env_vars_to_copy(
-            exclude_vars=WORKER_SPECIFIC_ENV_VARS,
+            exclude_vars=self.WORKER_SPECIFIC_ENV_VARS,
             additional_vars=set(current_platform.additional_env_vars),
             destination="workers",
         )
@@ -413,19 +426,20 @@ class RayDistributedExecutor(Executor):
         scheduler_output: SchedulerOutput,
         non_block: bool = False,
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
-        if self.scheduler_output is not None:
-            raise RuntimeError(
-                "State error: sample_tokens() must be called "
-                "after execute_model() returns None."
-            )
+        with self.tracer.log_event("ray_executor.execute_model"):
+            if self.scheduler_output is not None:
+                raise RuntimeError(
+                    "State error: sample_tokens() must be called "
+                    "after execute_model() returns None."
+                )
 
-        if not self.uses_sampler or not scheduler_output.total_num_scheduled_tokens:
-            # Model will not execute, call model runner immediately.
-            return self._execute_dag(scheduler_output, None, non_block)
+            if not self.uses_sampler or not scheduler_output.total_num_scheduled_tokens:
+                # Model will not execute, call model runner immediately.
+                return self._execute_dag(scheduler_output, None, non_block)
 
-        # Model will execute, defer to sample_tokens() call.
-        self.scheduler_output = scheduler_output
-        return COMPLETED_NONE_FUTURE if non_block else None
+            # Model will execute, defer to sample_tokens() call.
+            self.scheduler_output = scheduler_output
+            return COMPLETED_NONE_FUTURE if non_block else None
 
     def sample_tokens(  # type: ignore[override]
         self,
@@ -444,19 +458,41 @@ class RayDistributedExecutor(Executor):
         Returns:
             The model runner output.
         """
-        scheduler_output = self.scheduler_output
-        if scheduler_output is None:
-            return COMPLETED_NONE_FUTURE if non_block else None
+        with self.tracer.log_event("ray_executor.sample_tokens"):
+            scheduler_output = self.scheduler_output
+            if scheduler_output is None:
+                return COMPLETED_NONE_FUTURE if non_block else None
 
-        self.scheduler_output = None
+            self.scheduler_output = None
 
-        return self._execute_dag(scheduler_output, grammar_output, non_block)
+            return self._execute_dag(scheduler_output, grammar_output, non_block)
 
     @staticmethod
     def _get_async_refs(refs, worker, timeout=None):
         ray.get(refs, timeout=timeout)
-        logger.info(f"get_async_refs worker: {worker}")
         return worker.execute_method.remote("get_execute_model_output")
+
+    @staticmethod
+    def _get_async_pp_refs(
+        refs,
+        worker,
+        expected_step_id: int,
+        timeout=None,
+    ):
+        marker = ray.get(refs, timeout=timeout)
+        if not isinstance(marker, tuple) or len(marker) != 2:
+            raise RuntimeError(
+                f"Unexpected PP async marker from compiled DAG: {marker!r}"
+            )
+        _, step_id = marker
+        if step_id != expected_step_id:
+            raise RuntimeError(
+                "PP async marker step mismatch: "
+                f"expected {expected_step_id}, got {step_id}"
+            )
+        return worker.execute_method.remote(
+            "get_execute_model_output", step_id=expected_step_id
+        )
 
 
     def _execute_dag(
@@ -465,64 +501,79 @@ class RayDistributedExecutor(Executor):
         grammar_output: "GrammarOutput | None",
         non_block: bool = False,
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
-        use_async_pp = (
-            self.scheduler_config.async_scheduling
-            and self.parallel_config.pipeline_parallel_size > 1
-        )
-        # Build the compiled DAG for the first time.
-        if self.forward_dag is None:  # type: ignore
-            self.forward_dag = self._compiled_ray_dag(enable_asyncio=False)
-
-        if use_async_pp:
-            self._pp_async_step_id += 1
-            refs = self.forward_dag.execute(  # type: ignore
-                (scheduler_output, grammar_output, self._pp_async_step_id)
+        with self.tracer.log_event("ray_executor.execute_dag"):
+            use_async_pp = (
+                self.scheduler_config.async_scheduling
+                and self.parallel_config.pipeline_parallel_size > 1
             )
-        else:
-            refs = self.forward_dag.execute((scheduler_output, grammar_output))  # type: ignore
+            # Build the compiled DAG for the first time.
+            if self.forward_dag is None:  # type: ignore
+                with self.tracer.log_event("ray_executor.compiled_ray_dag_init"):
+                    self.forward_dag = self._compiled_ray_dag(enable_asyncio=False)
 
-        if self.scheduler_config.async_scheduling:
-            assert non_block
+            with self.tracer.log_event("ray_executor.forward_dag_execute"):
+                if use_async_pp:
+                    self._pp_async_step_id += 1
+                    submitted_step_id = self._pp_async_step_id
+                    refs = self.forward_dag.execute(  # type: ignore
+                        (scheduler_output, grammar_output, submitted_step_id)
+                    )
+                else:
+                    refs = self.forward_dag.execute((scheduler_output, grammar_output))  # type: ignore
 
-            if not use_async_pp:
-                # Non-PP async: delay output retrieval so the driver can
-                # schedule the next batch before blocking on this step's
-                # ModelRunnerOutput transfer.
-                # For PP async, the last rank now returns ModelRunnerOutput
-                # directly through the compiled DAG channel (same as
-                # non-async PP), so no extra wrapping is needed here.
-                output_workers = self.workers
-                assert len(refs) == len(output_workers), (
-                    "Ray compiled DAG outputs must match the output worker group."
-                )
-                refs = [
-                    partial(RayDistributedExecutor._get_async_refs, ref, worker)
-                    for ref, worker in zip(refs, output_workers)
-                ]
+            if self.scheduler_config.async_scheduling:
+                assert non_block
 
-        if not self.has_connector:
-            # Get output only from a single worker (output_rank)
-            # When PP is not used, we block here until the result is available.
+                if use_async_pp:
+                    # PP async: first wait for marker, then fetch this step's
+                    # materialized output by step_id.
+                    output_workers = self.pp_tp_workers[-1]
+                    assert len(refs) == len(output_workers), (
+                        "Ray compiled DAG outputs must match the last PP output "
+                        "worker group."
+                    )
+                    with self.tracer.log_event("ray_executor.wrap_async_pp_refs"):
+                        refs = [
+                            partial(
+                                RayDistributedExecutor._get_async_pp_refs,
+                                ref,
+                                worker,
+                                submitted_step_id,
+                            )
+                            for ref, worker in zip(refs, output_workers)
+                        ]
+                else:
+                    # Non-PP async: delay output retrieval so the driver can
+                    # schedule the next batch before blocking on this step's
+                    # ModelRunnerOutput transfer.
+                    output_workers = self.workers
+                    assert len(refs) == len(output_workers), (
+                        "Ray compiled DAG outputs must match the output worker group."
+                    )
+                    with self.tracer.log_event("ray_executor.wrap_async_refs"):
+                        refs = [
+                            partial(RayDistributedExecutor._get_async_refs, ref, worker)
+                            for ref, worker in zip(refs, output_workers)
+                        ]
+
+            if not self.has_connector:
+                # Get output only from a single worker (output_rank)
+                # When PP is not used, we block here until the result is available.
+                if not non_block:
+                    return refs[0].get()
+
+                # When PP is used, we return a FutureWrapper immediately so that
+                # the scheduler can yield to the next batch.
+                return FutureWrapper(refs[0])
+
+            # Get output from all workers when connector is present
+            assert self.kv_output_aggregator is not None
             if not non_block:
-                output = refs[0].get()
-                detach_zero_copy_from_model_runner_output(output)
-                return output
+                # Block and get results from all workers
+                return self.kv_output_aggregator.aggregate(ray.get(refs))
 
-            # When PP is used, we return a FutureWrapper immediately so that
-            # the scheduler can yield to the next batch.
-            return FutureWrapper(refs[0])
-
-        # Get output from all workers when connector is present
-        assert self.kv_output_aggregator is not None
-        if not non_block:
-            # Block and get results from all workers
-            outputs = ray.get(refs)
-            for output in outputs:
-                detach_zero_copy_from_model_runner_output(output)
-            return self.kv_output_aggregator.aggregate(outputs)
-
-        # Return a future that will aggregate outputs from all workers
-        return FutureWrapper(refs, self.kv_output_aggregator)
+            # Return a future that will aggregate outputs from all workers
+            return FutureWrapper(refs, self.kv_output_aggregator)
 
     def collective_rpc(  # type: ignore[override]
         self,
@@ -582,99 +633,100 @@ class RayDistributedExecutor(Executor):
             )
 
     def _compiled_ray_dag(self, enable_asyncio: bool):
-        assert self.parallel_config.use_ray
-        self._check_ray_cgraph_installation()
-        # Enlarge the default value of "RAY_CGRAPH_get_timeout" to 300 seconds
-        # (it is 10 seconds by default). This is a Ray environment variable to
-        # control the timeout of getting result from a compiled graph execution,
-        # i.e., the distributed execution that includes model forward runs and
-        # intermediate tensor communications, in the case of vllm.
-        # Note: we should set this env var before importing
-        # ray.dag, otherwise it will not take effect.
-        os.environ.setdefault("RAY_CGRAPH_get_timeout", "300")  # noqa: SIM112
-        from ray.dag import InputNode, MultiOutputNode
+        with self.tracer.log_event("ray_executor.compiled_ray_dag"):
+            assert self.parallel_config.use_ray
+            self._check_ray_cgraph_installation()
+            # Enlarge the default value of "RAY_CGRAPH_get_timeout" to 300 seconds
+            # (it is 10 seconds by default). This is a Ray environment variable to
+            # control the timeout of getting result from a compiled graph execution,
+            # i.e., the distributed execution that includes model forward runs and
+            # intermediate tensor communications, in the case of vllm.
+            # Note: we should set this env var before importing
+            # ray.dag, otherwise it will not take effect.
+            os.environ.setdefault("RAY_CGRAPH_get_timeout", "300")  # noqa: SIM112
+            from ray.dag import InputNode, MultiOutputNode
 
-        logger.info(
-            "RAY_CGRAPH_get_timeout is set to %s",
-            os.environ["RAY_CGRAPH_get_timeout"],  # noqa: SIM112
-        )
-        logger.info(
-            "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE = %s",
-            envs.VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE,
-        )
-        logger.info(
-            "VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM = %s",
-            envs.VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM,
-        )
-
-        channel_type = envs.VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE
-        if channel_type not in ("auto", "nccl", "shm"):
-            raise ValueError(
-                "Invalid value for VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: "
-                f"{channel_type}. Valid values are: 'auto', 'nccl', or 'shm'."
+            logger.info(
+                "RAY_CGRAPH_get_timeout is set to %s",
+                os.environ["RAY_CGRAPH_get_timeout"],  # noqa: SIM112
+            )
+            logger.info(
+                "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE = %s",
+                envs.VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE,
+            )
+            logger.info(
+                "VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM = %s",
+                envs.VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM,
             )
 
-        with InputNode() as input_data:
-            # Example DAG: PP=2, TP=4
-            #
-            # SchedulerOutput -> 0 -> (SchedulerOutput, IntermediateTensors) -> 4 -> ModelRunnerOutput   # noqa: E501
-            # SchedulerOutput -> 1 -> (SchedulerOutput, IntermediateTensors) -> 5 -> ModelRunnerOutput   # noqa: E501
-            # SchedulerOutput -> 2 -> (SchedulerOutput, IntermediateTensors) -> 6 -> ModelRunnerOutput   # noqa: E501
-            # SchedulerOutput -> 3 -> (SchedulerOutput, IntermediateTensors) -> 7 -> ModelRunnerOutput   # noqa: E501
+            channel_type = envs.VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE
+            if channel_type not in ("auto", "nccl", "shm"):
+                raise ValueError(
+                    "Invalid value for VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: "
+                    f"{channel_type}. Valid values are: 'auto', 'nccl', or 'shm'."
+                )
 
-            # All workers in the first TP group will take in the
-            # ExecuteModelRequest as input.
-            outputs = [input_data for _ in self.pp_tp_workers[0]]
-            for pp_rank, tp_group in enumerate(self.pp_tp_workers):
-                # Each PP worker takes in the output of the previous PP worker,
-                # and the TP group executes in SPMD fashion.
-                outputs = [
-                    worker.execute_model_ray.bind(outputs[i])  # type: ignore[attr-defined]
-                    for i, worker in enumerate(tp_group)
-                ]
+            with InputNode() as input_data:
+                # Example DAG: PP=2, TP=4
+                #
+                # SchedulerOutput -> 0 -> (SchedulerOutput, IntermediateTensors) -> 4 -> ModelRunnerOutput   # noqa: E501
+                # SchedulerOutput -> 1 -> (SchedulerOutput, IntermediateTensors) -> 5 -> ModelRunnerOutput   # noqa: E501
+                # SchedulerOutput -> 2 -> (SchedulerOutput, IntermediateTensors) -> 6 -> ModelRunnerOutput   # noqa: E501
+                # SchedulerOutput -> 3 -> (SchedulerOutput, IntermediateTensors) -> 7 -> ModelRunnerOutput   # noqa: E501
 
-                last_pp_rank = len(self.pp_tp_workers) - 1
-                if (
-                    pp_rank < last_pp_rank
-                    and envs.VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE != "shm"
-                ):
-                    # Specify how intermediate tensors should be passed
-                    # between pp stages, no need to specify for the last
-                    # pp stage or when using shared memory (the default).
-                    transport = envs.VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE
+                # All workers in the first TP group will take in the
+                # ExecuteModelRequest as input.
+                outputs = [input_data for _ in self.pp_tp_workers[0]]
+                for pp_rank, tp_group in enumerate(self.pp_tp_workers):
+                    # Each PP worker takes in the output of the previous PP worker,
+                    # and the TP group executes in SPMD fashion.
                     outputs = [
-                        output.with_tensor_transport(transport=transport)
-                        for output in outputs
+                        worker.execute_model_ray.bind(outputs[i])  # type: ignore[attr-defined]
+                        for i, worker in enumerate(tp_group)
                     ]
 
-            forward_dag = MultiOutputNode(outputs)
+                    last_pp_rank = len(self.pp_tp_workers) - 1
+                    if (
+                        pp_rank < last_pp_rank
+                        and envs.VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE != "shm"
+                    ):
+                        # Specify how intermediate tensors should be passed
+                        # between pp stages, no need to specify for the last
+                        # pp stage or when using shared memory (the default).
+                        transport = envs.VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE
+                        outputs = [
+                            output.with_tensor_transport(transport=transport)
+                            for output in outputs
+                        ]
 
-        if envs.VLLM_USE_RAY_WRAPPED_PP_COMM:
-            from ray.experimental.channel.accelerator_context import (
-                register_accelerator_context,
-            )
+                forward_dag = MultiOutputNode(outputs)
 
-            from vllm.distributed.device_communicators.ray_communicator import (
-                RayPPCommunicator,
-            )
+            if envs.VLLM_USE_RAY_WRAPPED_PP_COMM:
+                from ray.experimental.channel.accelerator_context import (
+                    register_accelerator_context,
+                )
 
-            register_accelerator_context(
-                torch_module_name="cuda", communicator_cls=RayPPCommunicator
-            )
-            logger.info(
-                "Using RayPPCommunicator "
-                "(which wraps vLLM _PP GroupCoordinator) "
-                "for Ray Compiled Graph communication."
-            )
-        else:
-            logger.info(
-                "Using Ray's NCCL communicator for Ray Compiled Graph communication."
-            )
+                from vllm.distributed.device_communicators.ray_communicator import (
+                    RayPPCommunicator,
+                )
 
-        return forward_dag.experimental_compile(
-            enable_asyncio=enable_asyncio,
-            _overlap_gpu_communication=envs.VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM,
-        )
+                register_accelerator_context(
+                    torch_module_name="cuda", communicator_cls=RayPPCommunicator
+                )
+                logger.info(
+                    "Using RayPPCommunicator "
+                    "(which wraps vLLM _PP GroupCoordinator) "
+                    "for Ray Compiled Graph communication."
+                )
+            else:
+                logger.info(
+                    "Using Ray's NCCL communicator for Ray Compiled Graph communication."
+                )
+
+            return forward_dag.experimental_compile(
+                enable_asyncio=enable_asyncio,
+                _overlap_gpu_communication=envs.VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM,
+            )
 
     def __del__(self):
         self.shutdown()
