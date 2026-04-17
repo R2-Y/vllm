@@ -580,7 +580,8 @@ class EngineCore:
                 self.log_iteration_details(scheduler_output),
             ):  
                 with self.tracer.log_event("wait ray dag return model output"):
-                    model_output = future.result()
+                    model_output = self._wait_for_result_with_input_drain(
+                        future)
                     if model_output is None:
                         # None from sample_tokens() implies that the original
                         # execute_model() call failed - raise that exception.
@@ -625,6 +626,54 @@ class EngineCore:
                 )
 
         return engine_core_outputs, model_executed
+
+    def _wait_for_result_with_input_drain(self, future):
+        """Wait for a future while draining the input queue.
+
+        Runs future.result() in a background thread so the main thread can
+        keep accepting new requests via _drain_input_queue().  This prevents
+        TTFT catastrophe under rate-limited arrivals where the engine loop
+        would otherwise block on future.result() for the full step duration.
+        """
+        result_container: list = []
+        error_container: list = []
+        done_event = threading.Event()
+
+        def _bg_wait():
+            try:
+                result_container.append(future.result())
+            except Exception as e:
+                error_container.append(e)
+            finally:
+                done_event.set()
+
+        t = threading.Thread(target=_bg_wait, daemon=True)
+        t.start()
+
+        num_drained = 0
+        while not done_event.is_set():
+            n = self._drain_input_queue()
+            num_drained += n
+            done_event.wait(timeout=0.001)
+
+        t.join()
+
+        if num_drained > 0:
+            logger.debug(
+                "Drained %d input requests while waiting for model output",
+                num_drained,
+            )
+
+        if error_container:
+            raise error_container[0]
+        return result_container[0]
+
+    def _drain_input_queue(self) -> int:
+        """Drain pending input requests. Override in subclass.
+
+        Returns the number of requests drained.
+        """
+        return 0
 
     def _process_aborts_queue(self):
         if not self.aborts_queue.empty():
@@ -1264,6 +1313,22 @@ class EngineCoreProc(EngineCore):
         while not self.input_queue.empty():
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)
+
+    def _drain_input_queue(self) -> int:
+        """Non-blocking drain of the input queue.
+
+        Called from EngineCore._wait_for_result_with_input_drain() while
+        the main thread polls for model output completion.
+        """
+        count = 0
+        while not self.input_queue.empty():
+            try:
+                req = self.input_queue.get_nowait()
+                self._handle_client_request(*req)
+                count += 1
+            except queue.Empty:
+                break
+        return count
 
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""

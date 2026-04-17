@@ -944,6 +944,18 @@ class Scheduler(SchedulerInterface):
             )
             scheduler_output.ec_connector_metadata = ec_meta
 
+        if preempted_reqs:
+            logger.warning(
+                "Schedule: %d preemptions this step, "
+                "kv_cache_usage=%.1f%%, running=%d, waiting=%d, "
+                "total_scheduled_tokens=%d",
+                len(preempted_reqs),
+                self.kv_cache_manager.usage * 100,
+                len(self.running),
+                len(self.waiting),
+                total_num_scheduled_tokens,
+            )
+
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
@@ -962,6 +974,7 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+        kv_usage_before = self.kv_cache_manager.usage
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
@@ -969,6 +982,18 @@ class Scheduler(SchedulerInterface):
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.num_preemptions += 1
+        logger.warning(
+            "Preempting request %s (preemption #%d, "
+            "computed_tokens=%d, kv_usage=%.1f%%->%.1f%%, "
+            "running=%d, waiting=%d)",
+            request.request_id,
+            request.num_preemptions,
+            request.num_prompt_tokens,
+            kv_usage_before * 100,
+            self.kv_cache_manager.usage * 100,
+            len(self.running),
+            len(self.waiting),
+        )
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 
