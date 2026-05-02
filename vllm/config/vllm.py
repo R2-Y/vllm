@@ -832,7 +832,6 @@ class VllmConfig:
                     "disable_padded_drafter_batch=True and will be disabled.",
                 )
                 self.scheduler_config.async_scheduling = False
-<<<<<<< HEAD
             else:
                 self.scheduler_config.async_scheduling = True
 

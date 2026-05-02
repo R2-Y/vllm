@@ -4480,7 +4480,6 @@ class GPUModelRunner(
         assert sampled_token_ids.dim() == 2 and sampled_token_ids.shape[-1] == 1, (
             "PP+async expects sampled_token_ids to have shape [num_reqs, 1]"
         )
-<<<<<<< HEAD
         # Skip for chunked prefill: sampled tokens are dummy
         # and will be discarded, no need to broadcast.
         if self._is_all_reqs_chunked_prefill():
@@ -4494,11 +4493,9 @@ class GPUModelRunner(
 
         # Ray compiled-DAG stages run independently, so group-wide broadcast
         # can deadlock when ranks are not synchronized at this point.
-=======
         # Post a non-blocking isend to each non-last PP rank.  Clone the tensor
         # so that the original can be freed while the NCCL transfer is in flight.
         _isend_t0 = pp_trace._now_us() if pp_trace.is_enabled() else 0.0
->>>>>>> bcb45632a (add analyze trace)
         works = []
         for rank_in_group in range(pp.world_size - 1):
             dst_global_rank = pp.ranks[rank_in_group]
@@ -4511,9 +4508,7 @@ class GPUModelRunner(
                 group=sampled_token_group,
             )
             works.append(work)
-<<<<<<< HEAD
         # Keep work handles alive until NCCL transfer is done.
-=======
         pp_trace.record_complete(
             "pp_isend_sampled_token",
             _isend_t0,
@@ -4521,7 +4516,6 @@ class GPUModelRunner(
             dst_ranks=str([pp.ranks[r] for r in range(pp.world_size - 1)]),
         )
         # Store works so the cloned tensors are kept alive until NCCL is done.
->>>>>>> bcb45632a (add analyze trace)
         self._pp_send_works = works
 
     def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
@@ -4560,8 +4554,6 @@ class GPUModelRunner(
                 req_state.output_token_ids.append(-1)
         self.input_batch.prev_req_id_to_index = prev_req_id_to_index
 
-<<<<<<< HEAD
-=======
     def _pp_post_irecv(
         self,
     ) -> tuple[Any, torch.Tensor, dict[str, int]]:
@@ -4652,7 +4644,6 @@ class GPUModelRunner(
         self.pp_sampled_token_recv_group = None
         self.pp_sampled_token_send_groups.clear()
 
->>>>>>> 2ac5e27b7 (Defer async PP sampled-token irecv completion into GPUModelRunner.execute_model() to overlap stage-0 CPU preprocessing with prior-stage execution)
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if not self.num_spec_tokens or not self._draft_token_req_ids:
             return None
